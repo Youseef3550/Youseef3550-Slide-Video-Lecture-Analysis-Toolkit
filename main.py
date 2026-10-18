@@ -65,6 +65,10 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+from quiz_routes import router as quiz_router
+app.include_router(quiz_router)
+from notes_routes import router as notes_router
+app.include_router(notes_router)
 
 ensure_app_directories()
 

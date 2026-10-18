@@ -267,14 +267,23 @@ def _overall_feedback(quiz, results, percentage, grade, weak):
     for r in results:
         q = questions.get(r["question_id"], {})
         score = "not graded" if r["score"] is None else r["score"]
-        lines.append(f"- {r['question_id']} [{r['type']}] {q.get('question', '')} | score: {score} | "
+        verdict = "correct" if r["is_correct"] else "wrong"
+        lines.append(f"- {r['question_id']} [{r['type']}] {q.get('question', '')} | {verdict} (score {score}) | "
                      f"timestamp {r['source']['timestamp']}")
+    correct = sum(1 for r in results if r["is_correct"])
+    total = len(results)
     prompt = (
-        "You are a tutor reviewing a student's quiz result.\n"
-        f"Quiz: {quiz['scope']['title']}. Score: {percentage}% (grade {grade}).\n"
+        "You are a strict but fair tutor reviewing a student's quiz result.\n"
+        f"Quiz: {quiz['scope']['title']}. Result: {correct} of {total} questions correct, "
+        f"score {percentage}% (grade {grade}).\n"
         "Questions:\n" + "\n".join(lines) + "\n\n"
-        "Write 2 to 3 sentences of encouraging, specific overall feedback. Then give up to 5 study recommendations, "
-        "each with a topic, the lecture timestamp (MM:SS) to review, and a short reason.\n"
+        "Rules:\n"
+        "- Start with the actual result. Do not praise more than the result justifies.\n"
+        "- Praise only if the score is 80% or higher. Below 60%, be direct and say clearly what went wrong.\n"
+        "- Name up to 3 wrong questions and the specific misunderstanding behind each, one sentence each.\n"
+        "- Then give up to 5 study recommendations, each with a topic, the lecture timestamp (MM:SS) to review, "
+        "and a short reason.\n"
+        "- Do not invent facts that are not in the questions above.\n"
         'Return only JSON like {"overall": "...", "recommendations": [{"topic": "...", "timestamp": "MM:SS", "reason": "..."}]}'
     )
     try:

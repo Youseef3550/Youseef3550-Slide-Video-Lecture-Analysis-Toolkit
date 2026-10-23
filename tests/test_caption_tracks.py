@@ -22,6 +22,38 @@ from processors import transcript_versions
 
 
 class CaptionTrackTests(unittest.TestCase):
+    def test_saved_uploads_include_persistent_completed_caption_variations(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8"))
+        function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "uploaded_videos")
+        function.decorator_list = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            videos = root / "videos"
+            videos.mkdir()
+            (videos / "parent.mp4").write_bytes(b"source")
+            (videos / "other.mp4").write_bytes(b"other source")
+            store = ExportJobStore(root / "exports")
+            for index, (video_id, status, title, filename, exists) in enumerate([
+                ("parent", "complete", "Captioned video - English", "English.mp4", True),
+                ("parent", "running", "Captioned video - German", "German.mp4", True),
+                ("parent", "complete", "Chapter export", "Chapter.mp4", True),
+                ("parent", "complete", "Captioned video - Missing", "Missing.mp4", False),
+                ("other", "complete", "Captioned video - Arabic", "Arabic.mp4", True),
+            ]):
+                job_id = f"{index:032x}"
+                store._write(job_id, {"id": job_id, "video_id": video_id, "status": status,
+                                     "instance": store.instance, "title": title, "filename": filename,
+                                     "created_at": index, "download_file": "download.mp4"})
+                if exists:
+                    (store._directory(job_id) / "download.mp4").write_bytes(b"copy")
+            namespace = {"VIDEO_DIR": videos, "export_jobs": store, "json": json}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), "<saved-uploads>", "exec"), namespace)
+            for _ in range(2):
+                result = asyncio.run(namespace["uploaded_videos"]())
+                saved = {video["video_id"]: video for video in result["videos"]}
+                self.assertEqual(saved["parent"]["caption_variations"], [{"id": "0" * 32, "filename": "English.mp4"}])
+                self.assertEqual(saved["other"]["caption_variations"], [{"id": f"{4:032x}", "filename": "Arabic.mp4"}])
+
     def test_job_persists_browser_tracks_after_workspace_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = ExportJobStore(Path(temporary) / "jobs")

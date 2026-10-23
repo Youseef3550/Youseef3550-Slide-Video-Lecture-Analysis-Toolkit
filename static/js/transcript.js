@@ -3,6 +3,20 @@
 import { elements } from './elements.js';
 import { state } from './main.js';
 import { scrollWithinContainer } from './scroll-utils.js';
+import { outlineRanges } from './outline-ranges.js';
+
+export function updateTranscriptReviewMarks() {
+    const ranges = outlineRanges(state.videoChapters);
+    elements.transcriptContainer.querySelectorAll('.transcript-line').forEach((row, index) => {
+        const time = state.currentTranscript[index]?.start;
+        const range = ranges.find(part => time >= part.start && time < part.end);
+        row.classList.toggle('outline-muted', Boolean(range?.flagged || range?.skipped));
+        row.title = range?.skipped ? 'Skipped during playback'
+            : range?.flagged ? `Review suggested: ${range.reason || 'Check this part'}` : '';
+    });
+}
+
+document.addEventListener('chaptersUpdated', updateTranscriptReviewMarks);
 
 /**
  * Loads the transcript data into the application
@@ -14,7 +28,8 @@ export function loadTranscript(transcript) {
         : (Array.isArray(transcript?.segments) ? transcript.segments : []);
     if (elements.generateSummaryBtn) {
         elements.generateSummaryBtn.disabled =
-            state.summaryGenerationInProgress || state.currentTranscript.length === 0;
+            (state.summaryGenerationInProgress && elements.generateSummaryBtn.getAttribute('aria-busy') !== 'true')
+            || state.currentTranscript.length === 0;
     }
     updateTranscriptDisplay();
     
@@ -77,6 +92,7 @@ export function updateTranscriptDisplay() {
         
         transcriptContainer.appendChild(div);
     });
+    updateTranscriptReviewMarks();
 }
 
 /**

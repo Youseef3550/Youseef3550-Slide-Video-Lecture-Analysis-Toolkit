@@ -4,11 +4,11 @@ import { setupVideoPlayer, updateTimeMarker, updateChapterCaptions } from './vid
 import { navigationParts } from './chapter-navigation.js';
 import { loadTranscript, updateTranscriptDisplay, updateActiveTranscript } from './transcript.js';
 import { checkSceneDetection, updateScenes, toggleSceneMarkers, findSceneAtTime, downloadSceneScreenshots, downloadSlidesPdf } from './scenes.js';
-import { generateChapters, updateChapters, exportChapters, updateExportAvailability, refreshSavedExports, attachChapterSlides } from './chapters.js';
+import { generateChapters, updateChapters, exportChapters, updateExportAvailability, refreshSavedExports, attachChapterSlides, initChapterGenerationOptions } from './chapters.js';
 import { setupSearch, setupSlideSearch, toggleTimestamps, toggleFuzzySearch } from './search.js';
 import { fetchOcrResults, updateSlideContentDisplay } from './ocr.js';
 import { setupTabs, showError, showLoading, showNotification, openSettingsModal, closeSettingsModal, saveSettings, generateWhisperTranscript } from './ui.js';
-import { processVideo, checkYoloStatus, processVideoUpload, loadUploadedVideo, detectScenes, regenerateTranscript, uploadTranscriptFile, translateTranscript, updateTranslationModelStatus, updateTranscriptionModelOptions, updateTranscriptModelHelp } from './api-module.js';
+import { processVideo, checkYoloStatus, processVideoUpload, loadUploadedVideo, detectScenes, regenerateTranscript, uploadTranscriptFile, translateTranscript, updateTranslationModelStatus, updateTranscriptionModelOptions, updateTranscriptModelHelp, renderSpeakerNames } from './api-module.js';
 import { elements } from './elements.js';
 import { initInteractiveLayer } from './interactive-layer.js';
 import { initTranscriptVersions } from './transcript-versions.js';
@@ -17,17 +17,32 @@ import { initVttBatch } from './vtt-batch.js';
 import { openOptionsDialog } from './utils.js';
 import { initChapterProjects } from './chapter-projects.js';
 import { initChapterTools } from './chapter-tools.js';
+import { initContextualHelp } from './contextual-help.js';
+import { initSavedChapters } from './saved-chapters.js';
+import { initSlideHistory } from './slide-history.js';
+import { initDeleteControls } from './delete-controls.js';
+import { initContentHistory } from './content-history.js';
 import { contentLanguage } from './content-languages.js';
 import { initSpeakerTimeline } from './speaker-timeline.js';
 import { initVideoSummary } from './video-summary.js';
 import { initInlineEditor } from './content-editor.js';
+import { initOutlineEditor } from './outline-editor.js';
+import { initClipMerge } from './clip-merge.js';
+import { initVideoSplit } from './video-split.js';
+import { initVideoSpeed } from './video-speed.js';
 import { initActionMenus } from './action-menus.js';
+import { initProjectHistory } from './project-history.js';
 import { initLibrary } from './library.js';
+import { initLibrarySearch } from './library-search.js';
+import { initCompatibleAudio } from './compatible-audio.js';
+import { initSecondJumps, initPlaybackSpeed } from './video.js';
 import { initFrameScreenshot } from './slide-downloads.js';
 
 // Global state
 export const state = {
+    outlineRowEditing: false,
     chapterGrouping: 'topic',
+    navigationKinds: ['chapters'],
     currentTranscript: [],
     videoScenes: [],
     sceneDetectionInterval: null,
@@ -176,11 +191,11 @@ let lastKey = null;
 function navigateChapter(direction) {
     const player = elements.videoPlayer;
     if (!player) return;
-    const times = navigationParts(state.videoChapters || [], state.videoScenes || [], state.chapterGrouping,
+    const times = navigationParts(state.videoChapters || [], state.videoScenes || [], state.navigationKinds ?? state.chapterGrouping,
         contentLanguage(state.currentVideoId, 'slides', state.currentTranslationLanguage))
         .map((part) => part.start);
     if (!times.length) {
-        showNotification('Generate chapters or detect slides for the selected navigation mode.', 'info');
+        showNotification('Generate chapters or detect slides, and select navigation types under Navigate by.', 'info');
         return;
     }
     const currentIndex = times.reduce((index, time, candidate) => (
@@ -307,6 +322,12 @@ async function loadExportSuggestions() {
 
 // Initialize the application
 function initApp() {
+    initChapterGenerationOptions();
+    initContextualHelp();
+    initSavedChapters();
+    initSlideHistory();
+    initDeleteControls();
+    initContentHistory();
     if (elements.videoPlayer) {
         elements.videoPlayer.controls = true;
         elements.videoPlayer.setAttribute('controls', '');
@@ -397,14 +418,43 @@ function initApp() {
     // Add event listeners
     bind(elements.generateSummaryBtn, 'click', generateChapters);
     bind(document.getElementById('downloadSlidesPdfBtn'), 'click', downloadSlidesPdf);
-    const navigationGrouping = document.getElementById('navigationGrouping');
     const setGrouping = (value) => {
         state.chapterGrouping = value;
-        if (navigationGrouping) navigationGrouping.value = value;
         if (elements.chapterGrouping) elements.chapterGrouping.value = value;
         updateChapterCaptions();
     };
-    bind(navigationGrouping, 'change', (event) => setGrouping(event.target.value));
+    const navigationControls = [
+        ['navigateChapters', 'chapters'], ['navigateSections', 'sections'], ['navigateSlides', 'slides'],
+    ];
+    try {
+        const saved = JSON.parse(localStorage.getItem('lectureseek-navigation-kinds') || 'null');
+        if (Array.isArray(saved) && saved.every(kind => navigationControls.some(([, value]) => value === kind))) {
+            state.navigationKinds = saved;
+        }
+    } catch (error) { showNotification(`Navigation preferences could not be loaded: ${error.message}`, 'error'); }
+    for (const [id, kind] of navigationControls) {
+        const input = document.getElementById(id);
+        if (!input) continue;
+        input.checked = state.navigationKinds.includes(kind);
+        bind(input, 'change', () => {
+            state.navigationKinds = navigationControls.filter(([name]) => document.getElementById(name)?.checked)
+                .map(([, value]) => value);
+            try { localStorage.setItem('lectureseek-navigation-kinds', JSON.stringify(state.navigationKinds)); }
+            catch (error) { showNotification(`Navigation preferences could not be saved: ${error.message}`, 'error'); }
+            updateChapterCaptions();
+        });
+    }
+    const navigationMenu = document.getElementById('navigationGrouping');
+    bind(navigationMenu, 'keydown', event => {
+        if (event.key === 'Escape') {
+            navigationMenu.open = false;
+            navigationMenu.querySelector('summary').focus();
+            event.stopPropagation();
+        }
+    });
+    document.addEventListener('click', event => {
+        if (navigationMenu?.open && !navigationMenu.contains(event.target)) navigationMenu.open = false;
+    });
     bind(elements.chapterGrouping, 'change', (event) => setGrouping(event.target.value));
     [['timelineSectionsToggle', 'timelineSectionsV2'], ['timelineSlidesToggle', 'timelineSlidesV2']].forEach(([id, key]) => {
         const toggle = document.getElementById(id);
@@ -482,11 +532,31 @@ function initApp() {
         void exportChapters();
     });
     document.addEventListener('transcriptUpdated', () => void refreshSavedExports());
+    document.addEventListener('transcriptUpdated', () => {
+        const names = Object.fromEntries((state.currentTranscript || [])
+            .filter(item => item.speaker && item.speaker_name)
+            .map(item => [item.speaker, item.speaker_name]));
+        renderSpeakerNames(names);
+    });
     initTranscriptVersions();
     initCaptionExport();
     initVttBatch(updateTranslationModelStatus);
     initInlineEditor();
+    initOutlineEditor();
+    initClipMerge();
+    initVideoSplit();
+    initVideoSpeed();
+    initLibrarySearch();
+    initCompatibleAudio();
+    initSecondJumps(elements.videoPlayer);
     initActionMenus();
+    initProjectHistory({
+        open: videoId => loadUploadedVideo(videoId),
+        isBusy: () => state.outlineRowEditing || Boolean(document.querySelector(
+            '.is-inline-editing, #contentEditorDialog[open], #contentEditorDialog.is-open'
+        )),
+        notify: showNotification,
+    });
     initLibrary();
     initFrameScreenshot();
     initSpeakerTimeline();
@@ -508,9 +578,7 @@ function initApp() {
     });
     bind(elements.previousChapterBtn, 'click', () => navigateChapter(-1));
     bind(elements.nextChapterBtn, 'click', () => navigateChapter(1));
-    bind(elements.playbackSpeed, 'change', (event) => {
-        elements.videoPlayer.playbackRate = Number(event.target.value);
-    });
+    initPlaybackSpeed(elements.videoPlayer, elements.playbackSpeed);
     bind(elements.transcriptOptionsBtn, 'click', () => {
         if (!elements.transcriptOptionsDialog.open) {
             openOptionsDialog(elements.transcriptOptionsDialog);
@@ -540,7 +608,7 @@ function initApp() {
             ? 'Adds topic boundaries that are not already close to a detected slide.'
             : 'Generate transcript chapters first to enable this option.';
         if (mode === 'chapters' && !hasChapters) {
-            elements.sceneDetectionMode.value = 'content';
+            elements.sceneDetectionMode.value = 'adaptive';
             return updateDetectionOptions();
         }
         elements.adaptiveDetectionOptions.hidden = mode !== 'adaptive';
@@ -553,7 +621,7 @@ function initApp() {
                 ? 'Content cuts detect abrupt visual transitions using the separate PySceneDetect threshold above.'
                 : 'Uses existing transcript chapter timestamps without scanning the complete video.';
     };
-    elements.sceneDetectionMode.value = localStorage.getItem('sceneDetectionModeV2') || 'content';
+    elements.sceneDetectionMode.value = localStorage.getItem('sceneDetectionModeV2') || 'adaptive';
     elements.adaptiveDetail.value = localStorage.getItem('adaptiveDetailV1') || 'balanced';
     elements.minimumSlideDuration.value = localStorage.getItem('minimumSlideDurationPercentV1') || 'auto';
     elements.maximumSlidesPerHour.value = localStorage.getItem('maximumSlidesPerHourV1') || 'auto';

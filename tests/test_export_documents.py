@@ -589,8 +589,44 @@ class ExportDocumentTests(unittest.TestCase):
         self.assertLessEqual(len(self.functions["concise_export_title"](title)), 36)
         self.assertIn('class="chapter-heading"', webpage)
         self.assertIn('class="subpart-heading"', webpage)
-        self.assertIn('.export-thumbnail img{width:120px;height:68px', webpage)
+        self.assertIn('.export-thumbnail{margin:.5rem 0;width:160px;max-width:100%', webpage)
+        self.assertIn('.export-thumbnail img{width:160px;height:90px;object-fit:contain', webpage)
         self.assertIn('target="_blank" rel="noopener" title="Enlarge:', webpage)
+
+    def test_webpage_sections_capture_their_own_frames_not_the_parent_image(self):
+        self.functions["SUMMARIES_DIR"].joinpath("lecture.json").write_text(json.dumps([
+            {"timestamp": "00:00", "title": "Chapter", "sections": [
+                {"timestamp": "00:00", "title": "Opening", "point": "Introduction", "timestamp_edited": True},
+                {"timestamp": "00:08", "title": "Validation", "point": "Evaluation", "timestamp_edited": True},
+                {"timestamp": "00:12", "title": "Regularization", "point": "Generalization", "timestamp_edited": True},
+            ]},
+        ]), encoding="utf-8")
+        folder = self.functions["FULLSIZE_IMAGES_DIR"] / "lecture"
+        folder.mkdir()
+        PillowImage.new("RGB", (40, 20), "blue").save(folder / "0.jpg")
+        PillowImage.new("RGB", (40, 20), "red").save(folder / "1.jpg")
+        for flag in ("include_webpage", "include_scorm"):
+            with self.subTest(flag=flag):
+                response = self.run_export(**{flag: True}, subpart_mode="points")
+                frame_commands = [command for command in self.media_commands
+                                  if Path(command[-1]).name.startswith("section_")]
+                self.assertEqual(
+                    [float(command[command.index("-ss") + 1]) for command in frame_commands],
+                    [0, 8, 12],
+                )
+                with zipfile.ZipFile(response.path) as archive:
+                    webpage = archive.read("index.html").decode()
+                    sections = re.findall(r'<details class="subpart"[^>]*>(.*?)'
+                                          r'</pre></details></details>', webpage, re.DOTALL)
+                    self.assertEqual(len(sections), 3)
+                    for index, section in enumerate(sections, 1):
+                        image_name = f"section_01_{index:02d}.jpg"
+                        self.assertIn(f'src="{image_name}"', section)
+                        self.assertIn(f'href="{image_name}"', section, "Enlarge opens the section image too")
+                        self.assertNotIn('src="01_Chapter.jpg"', section)
+                        self.assertIn(image_name, archive.namelist())
+                        self.assertNotEqual(archive.read(image_name), (folder / "0.jpg").read_bytes(),
+                                            "Do not reuse a stale detected slide for a section frame")
 
     def test_slides_pdf_http_download_and_temporary_cleanup(self):
         from fastapi import FastAPI, HTTPException as FastAPIException
@@ -629,7 +665,12 @@ class ExportDocumentTests(unittest.TestCase):
                        for command in self.media_commands if command[-1].endswith(".jpg")]
         self.assertNotIn(0, image_times)
         self.assertNotIn(9, image_times)
-        self.assertEqual(image_times, [], "Chapter images reuse the slide on screen at the chapter start")
+        section_times = [float(command[command.index("-ss") + 1])
+                         for command in self.media_commands
+                         if Path(command[-1]).name.startswith("section_")]
+        self.assertEqual(image_times, section_times,
+                         "Only sections without slides need their own video frame; chapter/slide images are reused")
+        self.assertEqual(section_times, [5.6, 8.0])
         with zipfile.ZipFile(response.path) as archive:
             self.assertEqual(archive.read("slide_0000000000.jpg"), (folder / "0.jpg").read_bytes())
             self.assertEqual(archive.read("slide_0000009000.jpg"), (folder / "1.jpg").read_bytes())

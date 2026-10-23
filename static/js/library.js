@@ -1,11 +1,13 @@
 import { state } from './main.js';
 import { showError } from './ui.js';
+import { removeSavedCaptionVariation } from './caption-export.js';
 
 export async function deleteSavedExport(item, kind = 'exports') {
     if (!window.confirm(`Permanently delete "${item.title}" and its exported files? This cannot be undone.`)) return false;
     const response = await fetch(`/library/exports/${kind}/${encodeURIComponent(item.id)}?confirm=true`, {method: 'DELETE'});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Could not delete export.');
+    removeSavedCaptionVariation(item.id);
     return true;
 }
 
@@ -85,6 +87,9 @@ export function initLibrary() {
                 throw error;
             }
             document.querySelector(`#uploadedVideos option[value="${video.video_id}"]`)?.remove();
+            for (const option of Array.from(document.getElementById('uploadedVideos')?.options || [])) {
+                if (option.dataset.videoId === video.video_id) option.remove();
+            }
             if (state.currentVideoId === video.video_id) {
                 // Reload clears all player/transcript state referencing the deleted upload.
                 location.reload();

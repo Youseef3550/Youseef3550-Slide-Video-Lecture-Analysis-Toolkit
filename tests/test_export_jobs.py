@@ -1,17 +1,21 @@
 import ast
+import asyncio
+import sys
 import shutil
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from export_jobs import ExportJobStore, cleanup_export_workspace, export_workspace
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.testclient import TestClient
+from caption_exports import render_captioned_video, render_selectable_captions
 
 
 class ExportJobTests(unittest.TestCase):
@@ -23,10 +27,89 @@ class ExportJobTests(unittest.TestCase):
     def wait_for_job(self, job_id):
         for _ in range(100):
             state = self.store.read(job_id)
-            if state["status"] in {"complete", "error"}:
+            if state["status"] in {"complete", "error", "cancelled"}:
                 return state
             time.sleep(0.02)
         self.fail("Export job did not finish")
+
+    def test_cancel_stops_process_and_removes_workspace(self):
+        started = threading.Event()
+        details = {}
+
+        async def generate(video_id, options, step, artifacts, workspace):
+            details["workspace"] = workspace
+            (workspace / "partial.mp4").write_bytes(b"unfinished")
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(60)")
+            details["process"] = process
+            started.set()
+            try:
+                await process.wait()
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+
+        job_id = self.store.start("video", {}, generate)
+        self.assertTrue(started.wait(5))
+        self.store.cancel(job_id)
+        self.store.cancel(job_id)
+        state = self.wait_for_job(job_id)
+        self.assertEqual(state["status"], "cancelled")
+        self.assertIsNotNone(details["process"].returncode)
+        self.assertFalse(details["workspace"].exists())
+        self.assertNotIn("download_url", state)
+        self.assertEqual(self.store.cancel(job_id)["status"], "cancelled")
+        self.assertEqual(ExportJobStore(self.directory.name).read(job_id)["status"], "cancelled")
+
+    def test_cancel_queued_job_does_not_start_generation(self):
+        generated = threading.Event()
+        cleaned = threading.Event()
+
+        async def generate(*args):
+            generated.set()
+
+        with patch("export_jobs.threading.Thread.start", autospec=True) as start:
+            job_id = self.store.start("video", {}, generate, on_finish=cleaned.set)
+            thread = start.call_args.args[0]
+            self.store.cancel(job_id)
+        thread.start()
+        self.assertEqual(self.wait_for_job(job_id)["status"], "cancelled")
+        self.assertFalse(generated.is_set())
+        self.assertTrue(cleaned.wait(5), "Queued cancellation must clean uploaded inputs too")
+
+    def test_both_caption_encoders_kill_process_on_cancellation(self):
+        create_process = asyncio.create_subprocess_exec
+        for mode in ("burn", "tracks"):
+            with self.subTest(mode=mode):
+                started = threading.Event()
+                details = {}
+
+                async def encoder_process(*args, **kwargs):
+                    process = await create_process(
+                        sys.executable, "-c", "import time; time.sleep(60)",
+                        stdout=asyncio.subprocess.PIPE)
+                    details["process"] = process
+                    started.set()
+                    return process
+
+                async def generate(video_id, options, step, artifacts, workspace):
+                    details["workspace"] = workspace
+                    captions = [{"start": 0, "duration": 1, "text": "Hello"}]
+                    if mode == "burn":
+                        return await render_captioned_video("source.mp4", captions, "copy", workspace, step)
+                    tracks = [{"captions": captions, "label": "English", "language": "eng"}]
+                    return await render_selectable_captions("source.mp4", tracks, "copy", workspace, step)
+
+                with patch("caption_exports.video_duration", new=AsyncMock(return_value=60)), \
+                        patch("caption_exports.asyncio.create_subprocess_exec", side_effect=encoder_process):
+                    job_id = self.store.start("video", {}, generate)
+                    self.assertTrue(started.wait(5))
+                    self.store.cancel(job_id)
+                    job = self.wait_for_job(job_id)
+                self.assertEqual(job["status"], "cancelled", job)
+                self.assertIsNotNone(details["process"].returncode)
+                self.assertFalse(details["workspace"].exists())
 
     def test_locked_state_file_does_not_abort_export(self):
         async def generate(video_id, options, step, artifacts, workspace):
@@ -40,6 +123,7 @@ class ExportJobTests(unittest.TestCase):
             job_id = self.store.start("video", {}, generate)
             state = self.wait_for_job(job_id)
         self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["filename"], f"lecture_{datetime.fromtimestamp(state['created_at']):%Y-%m-%d}.zip")
         self.assertIn("Encoding a clip", [step["message"] for step in state["steps"]])
 
     def test_steps_and_html_survive_restart_with_isolated_download(self):
@@ -67,6 +151,15 @@ class ExportJobTests(unittest.TestCase):
             restarted.file(job_id, "../state.json", webpage=True)
         with self.assertRaises(ValueError):
             restarted.read("../other")
+
+    def test_dated_filename_is_not_suffixed_twice(self):
+        async def generate(video_id, options, step, artifacts, workspace):
+            output = workspace / "lecture_2026-10-19.mp4"
+            output.write_bytes(b"video")
+            return SimpleNamespace(path=output)
+        job = self.wait_for_job(self.store.start("video", {}, generate))
+        self.assertEqual(job["status"], "complete")
+        self.assertEqual(job["filename"], "lecture_2026-10-19.mp4")
 
     def test_worker_errors_are_visible(self):
         async def generate(*args):
@@ -185,6 +278,7 @@ class ExportJobTests(unittest.TestCase):
         names = {
             "start_export_job", "read_export_job", "export_job_status",
             "saved_exports", "download_export_job", "open_export_webpage",
+            "cancel_caption_export",
         }
         routes = ast.Module(
             body=[node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -209,6 +303,17 @@ class ExportJobTests(unittest.TestCase):
             self.assertEqual(client.get(state["download_url"]).content, b"zip")
             self.assertEqual(len(client.get("/saved_exports/video").json()["exports"]), 1)
             self.assertEqual(client.get("/export_jobs/bad/status").status_code, 404)
+            self.assertEqual(client.post("/export_jobs/bad/cancel").status_code, 404)
+            self.assertEqual(client.post(f"/export_jobs/{data['job_id']}/cancel").status_code, 400)
+            caption_job = dict(state, title="Captioned video - English")
+            self.store._write(data["job_id"], caption_job)
+            self.assertEqual(client.post(f"/export_jobs/{data['job_id']}/cancel").json()["status"], "complete")
+            async def pending(*args):
+                await asyncio.sleep(60)
+            pending_id = self.store.start("video", {"document_title": "Captioned video - Pending"}, pending)
+            self.assertEqual(client.post(f"/export_jobs/{pending_id}/cancel").status_code, 200)
+            self.assertEqual(self.wait_for_job(pending_id)["status"], "cancelled")
+            self.assertEqual(client.get(f"/export_jobs/{pending_id}/download").status_code, 409)
             self.assertEqual(client.get(state["open_url"].replace("index.html", "missing.mp4")).status_code, 404)
             self.store.file(data["job_id"], state["download_file"]).unlink()
             self.assertEqual(client.get(state["download_url"]).status_code, 404)

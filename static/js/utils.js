@@ -19,25 +19,43 @@ export function extractVideoId(url) {
 }
 
 /**
- * Formats seconds into MM:SS format
+ * Formats seconds into MM:SS, or H:MM:SS from one hour onward.
  * @param {number} seconds - The time in seconds
  * @returns {string} - Formatted time string
  */
 export function formatTime(seconds) {
-    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor(seconds / 60) % 60;
     const secs = Math.floor(seconds % 60);
-    return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    const clock = `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    return hours ? `${hours}:${clock}` : clock;
+}
+
+export function formatTimestamp(timestamp) {
+    const value = String(timestamp);
+    const seconds = value.split(':').reduce((total, part) => total * 60 + Number(part), 0);
+    const fraction = value.match(/\.\d+$/)?.[0] || '';
+    return formatTime(Math.floor(seconds)) + fraction;
 }
 
 /**
  * Sends a generated file through one browser download flow.
  * Browser download settings control whether to prompt for a location.
  */
+export function datedExportFilename(filename, date = new Date()) {
+    const dot = filename.lastIndexOf('.');
+    const stem = dot > 0 ? filename.slice(0, dot) : filename;
+    const extension = dot > 0 ? filename.slice(dot) : '';
+    if (/_\d{4}-\d{2}-\d{2}$/.test(stem)) return filename;
+    const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    return `${stem}_${day}${extension}`;
+}
+
 export async function saveBlobToUserLocation(blob, filename, container = document.body) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = filename;
+    link.download = datedExportFilename(filename);
     link.style.display = 'none';
     container.appendChild(link);
     try {

@@ -1,0 +1,42 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const events = {};
+const errors = [];
+const player = {playbackRate: 1, defaultPlaybackRate: 1, readyState: 4, paused: false,
+    addEventListener: (name, fn) => { events[name] = fn; }};
+const select = {value: '1.75', options: ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2']
+    .map(value => ({value})), addEventListener: (_, fn) => { select.change = fn; }};
+const context = vm.createContext({showError: error => errors.push(error)});
+const source = fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 'video.js'), 'utf8')
+    .replace(/^import .*;\r?$/gm, '').replace(/^export /gm, '');
+vm.runInContext(source, context);
+context.initPlaybackSpeed(player, select);
+assert.equal(player.playbackRate, 1.75);
+assert.equal(player.defaultPlaybackRate, 1.75);
+select.value = '0.75';
+select.change();
+assert.equal(player.playbackRate, 0.75);
+assert.equal(player.paused, false);
+player.readyState = 0;
+player.playbackRate = 1;
+events.ratechange();
+assert.equal(select.value, '0.75', 'Source loading cannot overwrite the selected speed');
+events.loadstart();
+assert.equal(player.playbackRate, 0.75);
+select.value = '2';
+select.change();
+player.readyState = 4;
+events.loadedmetadata();
+assert.equal(player.playbackRate, 2, 'The latest choice wins during asynchronous media loading');
+player.playbackRate = 1.5;
+events.ratechange();
+assert.equal(select.value, '1.5', 'Native player rate changes update the dropdown');
+assert.equal(player.defaultPlaybackRate, 1.5);
+select.value = 'invalid';
+select.change();
+assert.equal(errors.length, 1);
+assert.equal(select.value, '1.5');
+assert.equal(player.paused, false);
+console.log('PASS: speed application, source reloads, latest choice, native controls and explicit errors');

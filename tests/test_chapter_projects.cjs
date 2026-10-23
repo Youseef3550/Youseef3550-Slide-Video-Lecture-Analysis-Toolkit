@@ -26,11 +26,13 @@ function fixture() {
     for (const id of ['chapterProjectStatus', 'openChapterProjectBtn', 'uploadedVideos']) ids[id] = element();
     let status = 'running';
     const context = vm.createContext({
+        startProcessButton: require('./process_button_stub.cjs'),
         state,
         contentLanguage: (_, __, language) => language || '',
         selectedMediaExportId: () => 'caption-copy',
         selectedCaptionTrackIndex: () => 1,
-        document: {getElementById: id => ids[id], createElement: element},
+        document: {getElementById: id => ids[id], createElement: element, addEventListener() {},
+            querySelectorAll: () => [], querySelector: () => null},
         localStorage: {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value),
             removeItem: key => storage.delete(key)},
         setTimeout: callback => { timers.push(callback); return timers.length; }, clearTimeout() {},
@@ -50,6 +52,33 @@ function fixture() {
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const chapters = [{timestamp: '00:00', title: 'First'}, {timestamp: '01:00', title: 'Next'}];
+{
+    const merge = {};
+    let selected = [];
+    const selectionContext = vm.createContext({
+        state: {videoChapters: [{sections: [{}, {}, {}]}, {sections: [{}, {}]}, {sections: [{}]}]},
+        document: {
+            getElementById: id => id === 'mergeSelectedSectionsBtn' ? merge : null,
+            querySelectorAll: () => selected.map(([chapter_index, section_index]) => ({
+                dataset: {clipSelection: JSON.stringify({chapter_index, section_index})},
+            })),
+        },
+    });
+    vm.runInContext(source.slice(source.indexOf('    const updateSelectionActions ='),
+        source.indexOf("    document.addEventListener('change'")) + '\nthis.update = updateSelectionActions;', selectionContext);
+    for (const [parts, enabled] of [
+        [[[0, 2], [1, 0]], true],
+        [[[1, 0], [0, 2]], true],
+        [[[0, 1], [1, 0]], false],
+        [[[0, 2], [1, 1]], false],
+        [[[0, 2], [2, 0]], false],
+        [[[0, 0], [0, 1], [1, 1]], true],
+    ]) {
+        selected = parts;
+        selectionContext.update();
+        assert.equal(!merge.disabled, enabled, `Merge eligibility for ${JSON.stringify(parts)}`);
+    }
+}
 
 (async () => {
     const first = fixture();
@@ -57,7 +86,26 @@ const chapters = [{timestamp: '00:00', title: 'First'}, {timestamp: '01:00', tit
     assert.equal(download.title, 'Download chapter video');
     assert.equal(download['aria-label'], 'Download chapter video');
     assert(!download.textContent?.includes('Download chapter video'), 'Keep the visible control icon-only');
+    const sectionChapters = [{...chapters[0], sections: [
+        {timestamp: '00:00', title: 'Part A'}, {timestamp: '00:20', title: 'Part B'},
+    ]}, chapters[1]];
+    const sectionFixture = fixture();
+    const sectionButton = sectionFixture.context.createChapterProjectButton(sectionChapters[0].sections[0], 0, sectionChapters, 0);
+    await sectionButton.click();
+    await flush();
+    const sectionPayload = JSON.parse(sectionFixture.requests[0].options.body);
+    assert.equal(sectionPayload.section_index, 0);
+    assert.equal(sectionPayload.title, 'Part A');
+    assert.equal(sectionPayload.next_timestamp, '00:20');
+    assert.equal(sectionPayload.media_export_id, 'caption-copy');
+    const lastSelection = sectionFixture.context.clipSelection(sectionChapters[0].sections[1], 0, sectionChapters, 1);
+    assert.equal(lastSelection.next_timestamp, '01:00');
+    assert.equal(sectionFixture.context.createChapterDownloadButton(
+        sectionChapters[0].sections[1], 0, sectionChapters, 1)['aria-label'], 'Download section video');
     const button = first.context.createChapterProjectButton(chapters[0], 0, chapters);
+    assert.equal(button.title, 'Open as a project');
+    assert.equal(button['aria-label'], 'Open as a project');
+    assert(!button.textContent?.includes('Open as project'), 'Project control is icon-only');
     let stopped = false;
     await button.listeners.click({stopPropagation() { stopped = true; }});
     await flush();
@@ -72,7 +120,8 @@ const chapters = [{timestamp: '00:00', title: 'First'}, {timestamp: '01:00', tit
     assert.match(first.ids.chapterProjectStatus.textContent, /Encoding/);
     assert.equal(first.storage.size, 1, 'Keep job id across reloads');
     await button.click();
-    assert.equal(first.requests.filter(request => request.options).length, 1, 'Prevent duplicate jobs');
+    assert.equal(first.requests.filter(request => request.url === '/chapter_projects/parent').length, 1, 'Prevent duplicate jobs');
+    assert.equal(first.requests.at(-1).url, '/chapter_project_jobs/job/cancel', 'Clicking the running button stops encoding');
     first.status('complete');
     await first.timers.shift()();
     await flush();

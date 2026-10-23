@@ -1,11 +1,16 @@
 import { state } from './main.js';
 import { elements } from './elements.js';
-import { startElapsedTimer } from './progress-time.js';
+import { startElapsedTimer, startProcessButton } from './progress-time.js';
 
 export function initVideoSummary() {
     const button = document.getElementById('generateVideoSummaryBtn');
     const paragraph = document.getElementById('videoSummaryText');
     const status = document.getElementById('videoSummaryStatus');
+    const panel = document.getElementById('videoSummaryPanel');
+    const setStatus = message => {
+        status.textContent = message;
+        status.hidden = !message;
+    };
     let selection = 0;
     let currentKey = '';
     let busyKey = '';
@@ -23,12 +28,12 @@ export function initVideoSummary() {
         currentKey = nextKey;
         const generation = ++selection;
         paragraph.textContent = '';
-        status.textContent = '';
+        panel.hidden = true;
+        panel.open = false;
+        setStatus('');
         if (!current.videoId || !current.transcript.length) {
-            status.textContent = 'Load a transcript to generate a short whole-video summary.';
             return;
         }
-        status.textContent = 'Loading saved summary...';
         try {
             const response = await fetch(`/video_summary/${encodeURIComponent(current.videoId)}/load`, {
                 method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(current),
@@ -37,9 +42,9 @@ export function initVideoSummary() {
             if (!response.ok) throw new Error(data.detail || `Could not load summary (${response.status})`);
             if (generation !== selection || nextKey !== key(snapshot())) return;
             paragraph.textContent = data.summary || '';
-            status.textContent = data.exists ? 'Saved summary of the open transcript.' : 'Generate a short paragraph covering the whole video.';
+            panel.hidden = !paragraph.textContent;
         } catch (error) {
-            if (generation === selection) status.textContent = error.message;
+            if (generation === selection) setStatus(error.message);
         }
     };
     button.addEventListener('click', async () => {
@@ -50,8 +55,9 @@ export function initVideoSummary() {
         ++selection;
         button.disabled = true;
         button.textContent = 'Generating summary...';
-        status.textContent = 'Reading the whole transcript and writing one short paragraph...';
+        setStatus('Reading the whole transcript and writing one short paragraph...');
         const stopElapsed = startElapsedTimer(status);
+        const stopButtonElapsed = startProcessButton(button, 'Generating summary');
         try {
             const response = await fetch(`/video_summary/${encodeURIComponent(current.videoId)}/generate`, {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -62,11 +68,14 @@ export function initVideoSummary() {
             if (requestKey !== key(snapshot())) return;
             ++selection;
             paragraph.textContent = data.summary;
-            status.textContent = 'Summary saved for this transcript.';
+            panel.hidden = false;
+            panel.open = true;
+            setStatus('');
         } catch (error) {
-            if (requestKey === key(snapshot())) status.textContent = `${error.message} Any previously saved summary was kept.`;
+            if (requestKey === key(snapshot())) setStatus(`${error.message} Any previously saved summary was kept.`);
         } finally {
             stopElapsed();
+            stopButtonElapsed();
             busyKey = '';
             button.textContent = 'Generate summary';
             button.disabled = !state.currentVideoId || !state.currentTranscript?.length;

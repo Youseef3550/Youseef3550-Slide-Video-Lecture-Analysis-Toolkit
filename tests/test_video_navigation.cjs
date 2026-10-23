@@ -52,4 +52,31 @@ state.videoChapters = [];
 state.videoScenes = [];
 navigateChapter(1);
 assert(notification.includes('Generate chapters'));
+state.videoChapters = [
+    {timestamp: '00:00', title: 'Chapter A', sections: [
+        {timestamp: '00:00', title: 'Section A'}, {timestamp: '00:10', title: 'Section B'}]},
+    {timestamp: '00:30', title: 'Chapter B', sections: [{timestamp: '00:30', title: 'Section C'}]},
+];
+state.videoScenes = [{time_seconds: 0}, {time_seconds: 15}, {time_seconds: 30}];
+for (let mask = 0; mask < 8; mask++) {
+    const kinds = ['chapters', 'sections', 'slides'].filter((_, index) => mask & (1 << index));
+    const expected = [...new Set([
+        ...(mask & 1 ? [0, 30] : []), ...(mask & 2 ? [0, 10, 30] : []), ...(mask & 4 ? [0, 15, 30] : []),
+    ])].sort((a, b) => a - b);
+    assert.deepEqual(navigationParts(state.videoChapters, state.videoScenes, kinds).map(part => part.start), expected);
+}
+state.navigationKinds = ['sections'];
+state.chapterGrouping = 'slides';
+elements.videoPlayer.currentTime = 0;
+navigateChapter(1);
+assert.equal(elements.videoPlayer.currentTime, 10, 'Section navigation is independent from export/timeline grouping');
+state.navigationKinds = ['chapters', 'sections', 'slides'];
+navigateChapter(1);
+assert.equal(elements.videoPlayer.currentTime, 15);
+navigateChapter(-1);
+assert.equal(elements.videoPlayer.currentTime, 10);
+state.navigationKinds = [];
+navigateChapter(1);
+assert.equal(elements.videoPlayer.currentTime, 10, 'No checked types does not seek');
+assert(notification.includes('Navigate by'));
 console.log('PASS: navigation scope, chapter timestamps, slide fallback and empty-state feedback');

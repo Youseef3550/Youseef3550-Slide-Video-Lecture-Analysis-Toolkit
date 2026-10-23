@@ -3,18 +3,92 @@
 import { elements } from './elements.js';
 import { state } from './main.js';
 import { showError, showErrorWithActions, showNotification } from './ui.js';
-import { saveBlobToUserLocation } from './utils.js';
+import { saveBlobToUserLocation, formatTime, formatTimestamp } from './utils.js';
 import { conciseTitle, slideTitle, sceneTopicTitle } from './chapter-navigation.js';
 import { scrollWithinContainer } from './scroll-utils.js';
 import { createSlideDownloadButton } from './slide-downloads.js';
-import { startElapsedTimer } from './progress-time.js';
+import { startElapsedTimer, startProcessButton } from './progress-time.js';
 import { selectedMediaExportId } from './caption-export.js';
-import { createChapterProjectButton, createChapterDownloadButton } from './chapter-projects.js';
-import { rowActions } from './action-menus.js';
+import { createChapterProjectButton, createChapterDownloadButton, createClipSelection } from './chapter-projects.js';
 import { deleteSavedExport } from './library.js';
 import { contentLanguage, setContentLanguage } from './content-languages.js';
+import { splitTimestamps } from './custom-clip-range.js';
+import { arrangeSectionRows } from './clip-arrangement.js';
 
 let chapterMarkerGeneration = 0;
+let summaryStatusTimer = null;
+let summaryJobVideoId = null;
+let chapterProcessButton = null;
+
+export function updateChapterGenerationOptions() {
+    const basis = document.getElementById('chapterBasis');
+    if (!basis) return;
+    const labeled = Boolean(state.currentTranscript?.length) && state.currentTranscript.every(cue => {
+        const speaker = cue.speaker || cue.speaker_name;
+        return typeof speaker === 'string' && Boolean(speaker.trim());
+    });
+    for (const option of basis.options) {
+        if (['speakers', 'topics_speakers'].includes(option.value)) {
+            option.disabled = !labeled;
+            option.title = labeled ? '' : 'Label every transcript line first in the Transcript tab.';
+        }
+    }
+    if (!labeled && ['speakers', 'topics_speakers'].includes(basis.value)) {
+        basis.value = 'topics';
+        basis.dispatchEvent(new Event('change'));
+    }
+    document.getElementById('chapterSpeakerHelp').textContent = labeled
+        ? 'Speaker boundaries are available for the fully labeled open transcript. Saved speaker names are used.'
+        : "Speaker modes are disabled: label every line's speaker in the Transcript tab first.";
+    const hasSlides = Boolean(state.videoScenes?.length);
+    const scope = document.getElementById('chapterSlideBoundaries');
+    const sectioned = elements.chapterStructure?.value !== 'flat';
+    for (const option of scope.options) {
+        option.disabled = (['chapters', 'both'].includes(option.value) && basis.value === 'timestamps')
+            || (['sections', 'both'].includes(option.value) && !sectioned);
+    }
+    if (scope.selectedOptions[0]?.disabled) scope.value = basis.value === 'timestamps' && sectioned ? 'sections' : 'none';
+    scope.disabled = !hasSlides || basis.value === 'speakers';
+    document.getElementById('chapterConsiderSlides').disabled = !hasSlides || basis.value !== 'topics';
+    document.getElementById('chapterSlideHelp').textContent = !hasSlides
+        ? 'Detect slides first to enable slide-aware boundaries. No OCR is required.'
+        : basis.value === 'speakers' ? 'Every speaker change uses exact saved speaker turns, not slide boundaries.'
+        : 'Detected slide changes inform generation and final cut verification. They are not mandatory cuts; spoken introductions are preserved. Exact timestamp chapters are never moved.';
+}
+
+export function initChapterGenerationOptions() {
+    initChapterPlaybackTracking();
+    const panel = document.getElementById('summaryOptionsPanel');
+    const close = () => {
+        panel.hidden = true;
+        document.getElementById('summaryOptionsBtn').focus();
+    };
+    document.getElementById('closeChapterOptionsBtn').addEventListener('click', close);
+    panel.addEventListener('keydown', event => {
+        if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
+    });
+    for (const event of ['transcriptUpdated', 'slidesUpdated', 'videoSelectionChanged']) {
+        document.addEventListener(event, updateChapterGenerationOptions);
+    }
+    for (const id of ['chapterBasis', 'chapterStructure', 'summaryOptionsBtn']) {
+        document.getElementById(id).addEventListener(id === 'summaryOptionsBtn' ? 'click' : 'change', updateChapterGenerationOptions);
+    }
+    updateChapterGenerationOptions();
+}
+
+function outlineControl(label, detail, insertion = false) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = insertion ? 'outline-insert' : 'btn btn-secondary btn-icon outline-pencil';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.innerHTML = insertion ? '+' : '<i class="fas fa-pen" aria-hidden="true"></i>';
+    button.addEventListener('click', event => {
+        event.stopPropagation();
+        document.dispatchEvent(new CustomEvent('outlineEditRequested', {detail: {...detail, anchor: button}}));
+    });
+    return button;
+}
 
 export function clearChapterMarkers() {
     chapterMarkerGeneration += 1;
@@ -363,7 +437,7 @@ export async function exportChapters() {
         stopDownloadElapsed?.();
         state.exportInProgress = false;
         button.disabled = false;
-        button.innerHTML = '<i class="fas fa-download"></i> Export Chapters';
+        button.innerHTML = '<i class="fas fa-download" aria-hidden="true"></i> Export chapters';
     }
 }
 
@@ -371,8 +445,22 @@ export async function exportChapters() {
  * Generates chapter markers from the transcript
  */
 export async function generateChapters() {
+    if (state.outlineRowEditing) { showError('Save or cancel the open row edit first.'); return; }
     if (state.summaryGenerationInProgress) {
-        showNotification('Chapter generation is already running.', 'info');
+        if (!summaryJobVideoId) {
+            showNotification('Another outline operation is running.', 'info');
+            return;
+        }
+        const button = elements.generateSummaryBtn;
+        chapterProcessButton?.update({stopping: true});
+        try {
+            const response = await fetch(`/cancel_summary/${encodeURIComponent(summaryJobVideoId)}`, {method: 'POST'});
+            const result = await readJsonResponse(response, 'Stop chapter generation');
+            if (!result.success) throw new Error(result.error);
+        } catch (error) {
+            showError(`Could not stop chapters: ${error.message}`);
+            chapterProcessButton?.update({stopping: false});
+        }
         return;
     }
     if (!state.currentTranscript?.length) {
@@ -383,17 +471,31 @@ export async function generateChapters() {
     document.dispatchEvent(new CustomEvent('summaryGenerationChanged'));
     const generateSummaryBtn = elements.generateSummaryBtn;
     let stopElapsed;
+    let stopButtonElapsed;
     
     try {
-        generateSummaryBtn.disabled = true;
-        generateSummaryBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Generating...';
+        chapterProcessButton = startProcessButton(generateSummaryBtn, 'Generating chapters', {cancellable: true});
+        stopButtonElapsed = chapterProcessButton;
         const passes = document.getElementById('chapterPasses')?.value || 'one';
+        const basis = document.getElementById('chapterBasis')?.value || 'topics';
+        if (['speakers', 'topics_speakers'].includes(basis)) {
+            const labeled = state.currentTranscript.every(cue => {
+                const speaker = cue.speaker || cue.speaker_name;
+                return typeof speaker === 'string' && Boolean(speaker.trim());
+            });
+            if (!labeled) throw new Error("Label every transcript line's speaker in the Transcript tab first.");
+        }
+        const cutPoints = basis === 'timestamps'
+            ? splitTimestamps(document.getElementById('chapterCutPoints').value) : undefined;
         const status = setSummaryStatus('generating', '<i class="fas fa-spinner fa-spin"></i> '
-            + (passes === 'two' ? 'Generating chapters, then reviewing topic boundaries (two passes)...'
-                : 'Generating chapters...'));
+            + (basis === 'timestamps' ? 'Generating chapter content within your exact timestamp boundaries...'
+                : basis === 'speakers' ? 'Creating chapters from saved speaker turns (no AI)...'
+                : passes === 'two' ? 'Generating and reviewing the outline, then verifying cut boundaries against the transcript...'
+                : 'Generating chapters and verifying cut boundaries against the transcript...'));
         stopElapsed = startElapsedTimer(status);
         showError('');
         const requestVideoId = state.currentVideoId;
+        summaryJobVideoId = requestVideoId;
         const requestLanguage = state.currentTranslationLanguage || '';
         const response = await fetch('/generate_summary', {
             method: 'POST',
@@ -409,10 +511,24 @@ export async function generateChapters() {
                 detail: elements.chapterDetail?.value || 'balanced',
                 instructions: (elements.chapterInstructions?.value || '').trim(),
                 passes,
+                basis,
+                flag_transcript_gaps: Boolean(document.getElementById('chapterFlagTranscriptGaps')?.checked),
+                transcript_gap_seconds: Number(document.getElementById('chapterTranscriptGapSeconds')?.value || 10),
+                ...(cutPoints ? {cut_points: cutPoints} : {}),
+                consider_slides: basis === 'topics'
+                    && !document.getElementById('chapterConsiderSlides')?.disabled
+                    && (document.getElementById('chapterConsiderSlides')?.checked ?? false),
+                slide_boundary_scope: document.getElementById('chapterSlideBoundaries')?.disabled
+                    ? 'none' : document.getElementById('chapterSlideBoundaries')?.value || 'none',
             })
         });
 
         const data = await readJsonResponse(response, 'Chapter generation');
+        if (data.cancelled) {
+            if (state.summaryRetryTimer) { clearInterval(state.summaryRetryTimer); state.summaryRetryTimer = null; }
+            setSummaryStatus('complete', 'Chapter generation stopped. Your existing chapters were kept.');
+            return;
+        }
 
         if (!data.success) {
             throw new Error(data.error);
@@ -492,14 +608,21 @@ export async function generateChapters() {
         }
     } finally {
         stopElapsed?.();
+        stopButtonElapsed?.();
+        chapterProcessButton = null;
+        summaryJobVideoId = null;
         state.summaryGenerationInProgress = false;
         document.dispatchEvent(new CustomEvent('summaryGenerationChanged'));
         generateSummaryBtn.disabled = false;
         generateSummaryBtn.innerHTML = '<i class="fas fa-magic"></i> Generate chapters';
+        generateSummaryBtn.removeAttribute('aria-busy');
+        generateSummaryBtn.removeAttribute('aria-label');
     }
 }
 
 function setSummaryStatus(state, message) {
+    clearTimeout(summaryStatusTimer);
+    summaryStatusTimer = null;
     let status = elements.summaryStatus;
     if (!status) {
         status = document.createElement('div');
@@ -507,11 +630,18 @@ function setSummaryStatus(state, message) {
         status.setAttribute('role', 'status');
         status.setAttribute('aria-live', 'polite');
         elements.chaptersContainer.prepend(status);
+        elements.summaryStatus = status;
     }
 
     status.className = `summary-status summary-status-${state.split(' ')[0]}`;
     status.innerHTML = message;
     status.hidden = false;
+    if (state.split(' ')[0] === 'complete') {
+        summaryStatusTimer = setTimeout(() => {
+            status.hidden = true;
+            summaryStatusTimer = null;
+        }, 5000);
+    }
     return status;
 }
 
@@ -532,73 +662,170 @@ async function readJsonResponse(response, operation) {
     return data;
 }
 
+function bindChapterSeek(row, time, label) {
+    row.tabIndex = 0;
+    row.setAttribute('aria-label', label);
+    const controls = 'button, input, textarea, select, summary, a, [contenteditable="true"]';
+    const seek = (event) => {
+        if (row.closest('.is-inline-editing') || event.target.closest(controls)) return;
+        elements.videoPlayer.currentTime = time;
+        elements.videoPlayer.play().catch((error) => {
+            if (error.name !== 'AbortError') {
+                console.warn('Unable to play chapter or section:', error);
+                showError(`Could not play the selected chapter or section: ${error.message}`);
+            }
+        });
+    };
+    row.addEventListener('click', seek);
+    row.addEventListener('keydown', (event) => {
+        if (event.target !== row || !['Enter', ' '].includes(event.key)) return;
+        event.preventDefault();
+        seek(event);
+    });
+}
+
 /**
  * Updates the chapters display with new chapter data
  * @param {Array} chapters - The chapter data
  */
-export function updateChapters(chapters, {editing = false} = {}) {
+function selectionKey(chapters, chapterIndex, sectionIndex) {
+    const chapter = chapters?.[chapterIndex];
+    const item = sectionIndex == null ? chapter : chapter?.sections?.[sectionIndex];
+    return item ? `${sectionIndex == null ? 'chapter' : 'section'}:${timestampSeconds(item.timestamp)}` : null;
+}
+
+export function captureChapterSelection(container, chapters, edit) {
+    const selected = new Set();
+    container.querySelectorAll('.clip-selection:checked').forEach(input => {
+        const {chapter_index: chapter, section_index: section} = JSON.parse(input.dataset.clipSelection);
+        if (edit?.action === 'delete' && chapter === edit.chapter && edit.section == null) return;
+        const affected = edit && chapter === edit.chapter &&
+            (edit.section == null ? section == null || section === 0 : section === edit.section);
+        if (affected && edit.action === 'delete') return;
+        const key = affected && edit.action === 'update'
+            ? `${section == null ? 'chapter' : 'section'}:${timestampSeconds(edit.timestamp)}`
+            : selectionKey(chapters, chapter, section);
+        if (key) selected.add(key);
+    });
+    return selected;
+}
+
+export function restoreChapterSelection(container, chapters, selected) {
+    container.querySelectorAll('.clip-selection').forEach(input => {
+        const {chapter_index: chapter, section_index: section} = JSON.parse(input.dataset.clipSelection);
+        input.checked = selected.has(selectionKey(chapters, chapter, section));
+    });
+}
+
+export function updateChapters(chapters, {editing = false, preserveExpansion = false, retimedChapter = null,
+    selectionEdit = null} = {}) {
     const chaptersContainer = elements.chaptersContainer;
     const status = elements.summaryStatus;
-    chaptersContainer.querySelectorAll(':scope > .chapter-item, :scope > .chapter-sections, :scope > .outline-move-zone, :scope > p').forEach(element => element.remove());
+    const selected = preserveExpansion
+        ? captureChapterSelection(chaptersContainer, state.videoChapters, selectionEdit) : new Set();
+    const expanded = new Map();
+    if (preserveExpansion) {
+        chaptersContainer.querySelectorAll(':scope > .chapter-item').forEach(row => {
+            const start = Number(row.dataset.start);
+            const key = retimedChapter && start === timestampSeconds(retimedChapter.previous)
+                ? timestampSeconds(retimedChapter.current) : start;
+            expanded.set(key, {
+                sections: row.querySelector(':scope > .chapter-expand')?.getAttribute('aria-expanded') === 'true',
+                summary: Boolean(row.querySelector('.chapter-summary-toggle')?.open),
+            });
+        });
+    }
+    chaptersContainer.querySelectorAll(':scope > .chapter-item, :scope > .chapter-sections, :scope > .outline-move-zone, :scope > .outline-insert, :scope > p').forEach(element => element.remove());
     if (status) {
         status.hidden = false;
     }
     
     if (!chapters || chapters.length === 0) {
         chaptersContainer.innerHTML = '<p>No chapters available.</p>';
+        if (!editing) chaptersContainer.appendChild(outlineControl('Add chapter', {action: 'add_chapter', chapter: 0}, true));
         setSummaryStatus('complete', '<i class="fas fa-info-circle"></i> No chapters are available.');
         // Still clear/refresh any stale timeline and scene captions from a
         // previously loaded video/language instead of leaving them stale.
         state.videoChapters = [];
+        activeChapterKey = '';
+        updateActiveChapter();
         document.dispatchEvent(new CustomEvent('chaptersUpdated', { detail: [] }));
         return;
     }
 
     // Update the list of chapters in the sidebar
+    if (!editing && timestampSeconds(chapters[0].timestamp) > 0) {
+        chaptersContainer.appendChild(outlineControl('Add chapter at the beginning', {action: 'add_chapter', chapter: 0}, true));
+    }
     chapters.forEach((chapter, index) => {
         const div = document.createElement('div');
         div.className = 'chapter-item';
         div.dataset.start = timestampSeconds(chapter.timestamp);
+        if (chapter.flagged || chapter.skipped) {
+            div.classList.add('outline-muted');
+            div.title = chapter.skipped ? 'Skipped during playback' : `Review suggested: ${chapter.flag_reason || 'Check this part'}`;
+        }
         const timestamp = document.createElement('span');
         timestamp.className = 'chapter-timestamp';
-        timestamp.textContent = chapter.timestamp;
+        timestamp.textContent = formatTimestamp(chapter.timestamp);
         const title = document.createElement('span');
         title.className = 'chapter-title';
         title.textContent = conciseTitle(chapter.title);
         title.title = chapter.title;
+        const number = document.createElement('span');
+        number.className = 'chapter-number';
+        number.textContent = `${index + 1}.`;
         div.appendChild(timestamp);
+        div.appendChild(number);
         div.appendChild(title);
-        const actions = rowActions(div, `Chapter ${index + 1} actions`);
-        actions.appendChild(createChapterProjectButton(chapter, index, chapters));
+        div.appendChild(createChapterProjectButton(chapter, index, chapters));
         div.appendChild(createChapterDownloadButton(chapter, index, chapters));
-        if (chapter.summary) div.title = chapter.summary;
-        div.onclick = (event) => {
-            if (div.closest('.is-inline-editing') || event.target.closest('button, input, textarea, details')) return;
-            const time = timestampSeconds(chapter.timestamp);
-            elements.videoPlayer.currentTime = time;
-            elements.videoPlayer.play().catch((error) => {
-                if (error.name !== 'AbortError') {
-                    console.warn('Unable to play chapter:', error);
-                }
-            });
-        };
+        if (!editing) div.appendChild(createClipSelection(chapter, index, chapters));
+        if (!editing) div.appendChild(outlineControl('Edit chapter', {action: 'update', chapter: index}));
+        if (chapter.summary && !editing) {
+            const disclosure = document.createElement('details');
+            disclosure.className = 'chapter-summary-toggle';
+            const toggle = document.createElement('summary');
+            toggle.textContent = 'Chapter summary';
+            const summary = document.createElement('p');
+            summary.className = 'chapter-summary';
+            summary.textContent = chapter.summary;
+            disclosure.append(toggle, summary);
+            div.appendChild(disclosure);
+        }
+        bindChapterSeek(div, timestampSeconds(chapter.timestamp), `Play chapter ${index + 1}: ${chapter.title}`);
         chaptersContainer.appendChild(div);
-        if (Array.isArray(chapter.sections) && (chapter.sections.length > 1 || (editing && chapter.sections.length))) {
-            const sections = renderChapterSections(chapter.sections);
+        if (Array.isArray(chapter.sections) && chapter.sections.length) {
+            const sections = renderChapterSections(chapter.sections, index, chapters, editing);
             sections.hidden = true;
             div.classList.add('has-sections');
             div.prepend(expandToggle(div, sections, 'sections'));
             chaptersContainer.appendChild(sections);
-        } else if (chapter.sections?.length === 1) {
-            const point = document.createElement('p');
-            point.className = 'chapter-single-point';
-            point.textContent = chapter.sections[0].point || '';
-            if (point.textContent) div.appendChild(point);
+        } else if (!editing) {
+            div.appendChild(outlineControl('Add section', {action: 'add_section', chapter: index, section: 0,
+                timestamp: chapter.timestamp}, true));
         }
+        if (!editing) chaptersContainer.appendChild(outlineControl('Add chapter here',
+            {action: 'add_chapter', chapter: index + 1, timestamp: formatClock(elements.videoPlayer?.currentTime || 0)}, true));
     });
     // Store the chapters in state
     state.videoChapters = chapters;
+    if (!editing && chapters[0]?.clip_arrangement) {
+        try { arrangeSectionRows(chaptersContainer, chapters); }
+        catch (error) { showError(error.message); }
+    }
     attachChapterSlides();
+    if (preserveExpansion) {
+        chaptersContainer.querySelectorAll(':scope > .chapter-item').forEach(row => {
+            const previous = expanded.get(Number(row.dataset.start));
+            if (!previous) return;
+            const toggle = row.querySelector(':scope > .chapter-expand');
+            if (previous.sections && toggle?.getAttribute('aria-expanded') === 'false') toggle.click();
+            const summary = row.querySelector('.chapter-summary-toggle');
+            if (summary) summary.open = previous.summary;
+        });
+    }
+    restoreChapterSelection(chaptersContainer, chapters, selected);
     document.dispatchEvent(new CustomEvent('chaptersUpdated', { detail: chapters }));
     elements.exportChaptersBtn.disabled = false;
     setSummaryStatus('complete', '<i class="fas fa-check-circle"></i> Chapters ready.');
@@ -669,7 +896,7 @@ export function attachChapterSlides() {
         const list = document.createElement('ol');
         list.className = 'chapter-slides';
         inside.forEach(({ scene, index, time }) => list.appendChild(slideRow(scene, index, time)));
-        rowActions(row).appendChild(createSlideDownloadButton(inside.map(({ index }) => index),
+        row.appendChild(createSlideDownloadButton(inside.map(({ index }) => index),
             `Download all slides in ${row.tagName === 'LI' ? 'section' : 'chapter'} (${inside.length})`, {archive: true}));
         row.classList.add('has-slides');
         row.prepend(expandToggle(row, list, 'slides'));
@@ -685,7 +912,7 @@ export function attachChapterSlides() {
     container.querySelectorAll(':scope > .chapter-item.has-sections').forEach((chapter) => {
         const sections = chapter.nextElementSibling;
         const indices = [...sections.querySelectorAll('.chapter-slide')].map((slide) => Number(slide.dataset.index));
-        if (indices.length) rowActions(chapter).appendChild(createSlideDownloadButton(indices,
+        if (indices.length) chapter.appendChild(createSlideDownloadButton(indices,
             `Download all slides in chapter (${indices.length})`, {archive: true}));
     });
     activeChapterKey = '';
@@ -707,7 +934,7 @@ function slideRow(scene, index, time) {
     }
     const timestamp = document.createElement('span');
     timestamp.className = 'chapter-timestamp';
-    timestamp.textContent = scene.timestamp || formatClock(time);
+    timestamp.textContent = scene.timestamp ? formatTimestamp(scene.timestamp) : formatClock(time);
     const title = document.createElement('span');
     title.textContent = slideTitle(scene, contentLanguage(state.currentVideoId, 'slides', state.currentTranslationLanguage))
         || sceneTopicTitle(state.videoChapters || [], Number(scene.time_seconds)) || `Slide ${index + 1}`;
@@ -719,6 +946,7 @@ function slideRow(scene, index, time) {
     };
     item.addEventListener('click', seek);
     item.addEventListener('keydown', (event) => {
+        if (event.target.closest('button, input, textarea, details')) return;
         if (event.key === 'Enter' || event.key === ' ') {
             event.preventDefault();
             seek(event);
@@ -728,13 +956,34 @@ function slideRow(scene, index, time) {
 }
 
 function formatClock(seconds) {
-    const total = Math.max(0, Math.floor(seconds));
-    const hours = Math.floor(total / 3600);
-    const clock = `${String(Math.floor((total % 3600) / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
-    return hours ? `${hours}:${clock}` : clock;
+    return formatTime(Math.max(0, seconds));
 }
 
 let activeChapterKey = '';
+let chapterPlaybackTracking = true;
+
+export function initChapterPlaybackTracking() {
+    const toggle = document.getElementById('chapterPlaybackTracking');
+    if (!toggle) return;
+    try {
+        chapterPlaybackTracking = localStorage.getItem('chapterPlaybackTracking') !== 'false';
+    } catch (error) {
+        showError(`Could not read the chapter playback preference: ${error.message}`);
+    }
+    toggle.checked = chapterPlaybackTracking;
+    toggle.addEventListener('change', () => {
+        chapterPlaybackTracking = toggle.checked;
+        try {
+            localStorage.setItem('chapterPlaybackTracking', String(chapterPlaybackTracking));
+        } catch (error) {
+            showError(`Could not save the chapter playback preference: ${error.message}`);
+        }
+        activeChapterKey = '';
+        updateActiveChapter();
+    });
+    activeChapterKey = '';
+    updateActiveChapter();
+}
 
 /** Highlights the chapter and section being played, like the active transcript line. */
 export function updateActiveChapter() {
@@ -742,12 +991,33 @@ export function updateActiveChapter() {
     const container = elements.chaptersContainer;
     const time = elements.videoPlayer?.currentTime;
     if (!container || !Number.isFinite(time)) return;
+    const nowPlaying = document.getElementById('chapterNowPlaying');
+    if (!chapterPlaybackTracking) {
+        container.querySelectorAll('.chapter-item.active, .chapter-section.active, .chapter-slide.active')
+            .forEach(item => {
+                item.classList.remove('active');
+                item.removeAttribute('aria-current');
+            });
+        if (nowPlaying) { nowPlaying.hidden = true; nowPlaying.textContent = ''; }
+        return;
+    }
     const latest = (items) => items.reduce((found, item) => (
-        Number(item.dataset.start) <= time + 0.01 ? item : found
+        Number(item.dataset.start) <= time + 0.01 &&
+            (!found || Number(item.dataset.start) >= Number(found.dataset.start)) ? item : found
     ), null);
-    const chapter = latest([...container.querySelectorAll('.chapter-item')]);
-    const sectionList = chapter?.nextElementSibling?.classList.contains('chapter-sections') ? chapter.nextElementSibling : null;
-    const section = sectionList ? latest([...sectionList.querySelectorAll('.chapter-section')]) : null;
+    const chapters = [...container.querySelectorAll('.chapter-item')];
+    let chapter = latest(chapters);
+    let sectionList = chapter?.nextElementSibling?.classList.contains('chapter-sections') ? chapter.nextElementSibling : null;
+    let section = sectionList ? latest([...sectionList.querySelectorAll('.chapter-section')]) : null;
+    if (state.videoChapters?.[0]?.clip_arrangement) {
+        const sourceChapterIndex = chapters.indexOf(chapter);
+        section = latest([...container.querySelectorAll('.chapter-section')]
+            .filter(row => Number(row.dataset.sourceChapterIndex) === sourceChapterIndex));
+        if (section) {
+            sectionList = section.closest('.chapter-sections');
+            chapter = sectionList.previousElementSibling;
+        }
+    }
     const slide = latest([...container.querySelectorAll('.chapter-slide')]);
     const slideList = slide?.closest('.chapter-slides');
     const slideVisible = Boolean(slide && slideList && !slideList.hidden && !slideList.closest('[hidden]'));
@@ -755,12 +1025,35 @@ export function updateActiveChapter() {
     if (key === activeChapterKey) return;
     activeChapterKey = key;
     container.querySelectorAll('.chapter-item.active, .chapter-section.active, .chapter-slide.active')
-        .forEach((item) => item.classList.remove('active'));
-    chapter?.classList.add('active');
-    section?.classList.add('active');
-    slide?.classList.add('active');
+        .forEach((item) => {
+            item.classList.remove('active');
+            item.removeAttribute('aria-current');
+        });
+    for (const item of [chapter, section, slide]) {
+        if (!item) continue;
+        item.classList.add('active');
+        item.setAttribute('aria-current', 'location');
+    }
+    if (nowPlaying) {
+        const chapterIndex = chapters.indexOf(chapter);
+        const chapterData = state.videoChapters?.[chapterIndex];
+        const sections = sectionList ? [...sectionList.querySelectorAll('.chapter-section')] : [];
+        const sectionIndex = sections.indexOf(section);
+        const sectionData = section?.dataset.sourceChapterIndex != null
+            ? state.videoChapters?.[Number(section.dataset.sourceChapterIndex)]?.sections?.[Number(section.dataset.sourceSectionIndex)]
+            : chapterData?.sections?.[sectionIndex];
+        const text = chapterData ? [
+            `Now playing: Chapter ${chapterIndex + 1}: ${chapterData.title}`,
+            sectionData ? `Section ${chapterIndex + 1}.${sectionIndex + 1}: ${sectionData.title}` : '',
+        ].filter(Boolean).join(' / ') : '';
+        if (nowPlaying.textContent !== text) nowPlaying.textContent = text;
+        nowPlaying.hidden = !text;
+    }
     const visible = slideVisible ? slide : section && !sectionList.hidden ? section : chapter;
-    if (visible) scrollWithinContainer(scrollParent(container), visible);
+    // Do not move a row away from the pointer or keyboard focus while it is being used.
+    if (visible && !container.matches(':hover, :focus-within')) {
+        scrollWithinContainer(scrollParent(container), visible);
+    }
 }
 
 function scrollParent(element) {
@@ -771,43 +1064,67 @@ function scrollParent(element) {
     return element;
 }
 
+export function revealOutlineSearchResult(result) {
+    if (!['section', 'chapter', 'summary'].includes(result.kind) || !Number.isFinite(result.timestamp)) return null;
+    const container = elements.chaptersContainer;
+    const selector = result.kind === 'section' ? '.chapter-section' : '.chapter-item';
+    const matches = [...container.querySelectorAll(selector)]
+        .filter(row => Math.abs(Number(row.dataset.start) - result.timestamp) < 0.001);
+    const row = matches.find(item =>
+        item.querySelector(result.kind === 'section' ? '.section-title' : '.chapter-title')?.textContent === result.title)
+        || matches[0];
+    if (!row) return null;
+    document.querySelector('.tab-btn[data-tab="chapters"]')?.click();
+    if (result.kind === 'section') {
+        const list = row.closest('.chapter-sections');
+        if (list?.hidden) list.previousElementSibling?.querySelector('.chapter-expand')?.click();
+    }
+    row.focus({preventScroll: true});
+    scrollWithinContainer(scrollParent(container), row);
+    return row;
+}
+
 function timestampSeconds(timestamp) {
     return String(timestamp).split(':').map(Number).reduce((total, part) => total * 60 + part, 0);
 }
 
-function renderChapterSections(sections) {
+function renderChapterSections(sections, chapterIndex, chapters, editing = false) {
     const list = document.createElement('ol');
     list.className = 'chapter-sections';
-    sections.forEach((section) => {
+    list.dataset.chapterIndex = String(chapterIndex);
+    if (!editing && timestampSeconds(sections[0].timestamp) > timestampSeconds(chapters[chapterIndex].timestamp)) list.appendChild(outlineControl('Add section at the beginning',
+        {action: 'add_section', chapter: chapterIndex, section: 0, timestamp: chapters[chapterIndex].timestamp}, true));
+    sections.forEach((section, sectionIndex) => {
         const item = document.createElement('li');
         item.className = 'chapter-section';
         item.tabIndex = 0;
         item.dataset.start = timestampSeconds(section.timestamp);
+        item.dataset.sourceTimestamp = section.timestamp;
+        item.dataset.sourceChapterIndex = String(chapterIndex);
+        item.dataset.sourceSectionIndex = String(sectionIndex);
+        if (section.flagged || section.skipped || chapters[chapterIndex].flagged || chapters[chapterIndex].skipped) {
+            item.classList.add('outline-muted');
+        }
         const timestamp = document.createElement('span');
         timestamp.className = 'chapter-timestamp';
-        timestamp.textContent = section.timestamp;
+        timestamp.textContent = formatTimestamp(section.timestamp);
         const title = document.createElement('span');
         title.className = 'section-title';
         title.textContent = section.title;
         item.appendChild(timestamp);
         item.appendChild(title);
-        rowActions(item, 'Part actions');
-        if (section.point) item.title = section.point;
-        const seek = () => {
-            if (item.closest('.is-inline-editing')) return;
-            elements.videoPlayer.currentTime = timestampSeconds(section.timestamp);
-            elements.videoPlayer.play().catch((error) => {
-                if (error.name !== 'AbortError') console.warn('Unable to play section:', error);
-            });
-        };
-        item.addEventListener('click', seek);
-        item.addEventListener('keydown', (event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault();
-                seek();
-            }
-        });
+        item.appendChild(createChapterProjectButton(section, chapterIndex, chapters, sectionIndex));
+        item.appendChild(createChapterDownloadButton(section, chapterIndex, chapters, sectionIndex));
+        if (!editing) item.appendChild(createClipSelection(section, chapterIndex, chapters, sectionIndex));
+        if (!editing) item.appendChild(outlineControl('Edit section',
+            {action: 'update', chapter: chapterIndex, section: sectionIndex}));
+        item.title = [section.skipped ? 'Skipped during playback' : '', section.flagged
+            ? `Review suggested: ${section.flag_reason || 'Check this part'}` : '', section.point || ''].filter(Boolean).join('\n');
+        bindChapterSeek(item, timestampSeconds(section.timestamp), `Play section: ${section.title}`);
         list.appendChild(item);
+        if (!editing) list.appendChild(outlineControl('Add section or start new chapter here', {action: 'insert_boundary',
+            chapter: chapterIndex, section: sectionIndex + 1,
+            timestamp: formatClock(elements.videoPlayer?.currentTime || 0)}, true));
     });
     return list;
 }

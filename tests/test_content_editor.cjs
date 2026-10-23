@@ -5,6 +5,10 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 'content-editor.js'), 'utf8')
     .replace(/^import .+;$/gm, '').replace(/^export /gm, '');
 const context = vm.createContext({});
+assert(!source.includes('The earlier title and timestamp will be kept'),
+    'Merge confirmation must not promise to keep the first title');
+assert(source.includes('Review its editable title and summary before saving.'),
+    'Reorganization merge must describe its actual editable result');
 vm.runInContext(source, context);
 const outline = [
     {timestamp: '00:00', title: 'First', summary: 'One', sections: [
@@ -22,6 +26,13 @@ assert.equal(merged[0].sections[0].title, 'A');
 assert.equal(merged[0].sections[0].timestamp, '00:00');
 assert.match(merged[0].sections[0].point, /Alpha[\s\S]*B[\s\S]*Beta/);
 const chapter = apply({action: 'merge_chapter', chapter: 0});
+const crossChapter = apply({action: 'merge_section', chapter: 0, section: 2});
+assert.equal(crossChapter[0].sections.at(-1).timestamp, '00:20');
+assert.match(crossChapter[0].sections.at(-1).point, /Gamma[\s\S]*Delta/);
+assert.equal(crossChapter[1].timestamp, '00:40');
+assert.equal(crossChapter[1].sections.length, 1);
+const consumed = context.applyOutlineOperation(crossChapter, {action: 'merge_section', chapter: 0, section: 2});
+assert.equal(consumed.length, 1, 'A fully consumed chapter must not leave an overlapping boundary');
 assert.equal(chapter.length, 1);
 assert.equal(chapter[0].title, 'First');
 assert.equal(chapter[0].sections.length, 5);
@@ -46,6 +57,67 @@ assert.throws(() => context.applyOutlineOperation(retimed, {action: 'promote', c
 const renamed = JSON.parse(JSON.stringify(outline));
 renamed[0].sections[1].title = 'Renamed';
 assert.equal(context.applyOutlineOperation(renamed, {action: 'promote', chapter: 0, section: 1}, outline)[1].title, 'Renamed');
+const firstTimeField = {value: '00:00'};
+let titleTimeField;
+const timestampChapter = {timestamp: '00:00', sections: [{timestamp: '00:00'}, {timestamp: '00:30'}]};
+const fieldContext = vm.createContext({
+    editing: {kind: 'chapters', draft: []},
+    document: {createElement: () => ({
+        listeners: {}, setAttribute() {},
+        addEventListener(name, handler) { this.listeners[name] = handler; },
+    })},
+});
+vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 'utils.js'), 'utf8')
+    .replace(/^export /gm, ''), fieldContext);
+vm.runInContext(source.slice(source.indexOf('    function input('), source.indexOf('    function actionButton(')),
+    fieldContext);
+fieldContext.input({
+    querySelector: () => ({replaceWith(field) { titleTimeField = field; }}),
+    nextElementSibling: {querySelector: () => firstTimeField},
+}, '.chapter-timestamp', 'Chapter start', timestampChapter, 'timestamp');
+titleTimeField.value = '00:10';
+titleTimeField.listeners.input();
+assert.equal(timestampChapter.timestamp, '00:10');
+assert.equal(timestampChapter.sections[0].timestamp, '00:10');
+assert.equal(firstTimeField.value, '00:10', 'First section field updates immediately, before saving');
+assert.equal(timestampChapter.sections[1].timestamp, '00:30', 'Other section boundaries stay unchanged');
+const longChapter = {timestamp: '74:00.125'};
+fieldContext.input({
+    querySelector: () => ({replaceWith(field) { titleTimeField = field; }}),
+}, '.chapter-timestamp', 'Chapter start', longChapter, 'timestamp');
+assert.equal(titleTimeField.value, '1:14:00.125');
+assert.equal(longChapter.timestamp, '74:00.125', 'Opening an editor must not rewrite saved timestamps');
+const notesContext = vm.createContext({
+    document: {createElement: tag => ({
+        tag, children: [], appendChild(child) { this.children.push(child); }, addEventListener() {},
+        setAttribute(name, value) { this[name] = value; },
+    })},
+});
+vm.runInContext(source.slice(source.indexOf('    function notes('), source.indexOf('    function editControls(')),
+    notesContext);
+const notesParent = {children: [], appendChild(child) { this.children.push(child); }};
+notesContext.notes(notesParent, 'Chapter summary', {summary: 'Saved summary'}, 'summary');
+const disclosure = notesParent.children[0];
+assert.equal(disclosure.tag, 'details');
+assert(!disclosure.open, 'Chapter summaries are collapsed while editing too');
+assert.equal(disclosure.children[1].children[0].value, 'Saved summary');
+assert.equal(disclosure.children[0]['aria-label'], 'Chapter summary');
+assert.equal(disclosure.children[0].children[0].className, 'fas fa-align-left');
+notesContext.notes(notesParent, 'Section summary', {point: 'Saved section summary'}, 'point');
+const sectionDisclosure = notesParent.children[1];
+assert.equal(sectionDisclosure.tag, 'details');
+assert(!sectionDisclosure.open, 'Section summaries are also collapsed in the full editor');
+assert.equal(sectionDisclosure.children[0]['aria-label'], 'Section summary');
+assert.equal(sectionDisclosure.children[1].children[0].value, 'Saved section summary');
+assert(source.includes("row.querySelector('.chapter-expand')?.click();"),
+    'Reorganizing expands sections through the shared toggle, keeping its accessible state consistent');
+vm.runInContext(source.slice(source.indexOf('    function actionButton('), source.indexOf('    function notes(')),
+    notesContext);
+notesContext.actionButton(notesParent, 'Merge with next chapter', {action: 'merge_chapter'});
+const mergeButton = notesParent.children.at(-1);
+assert.equal(mergeButton['aria-label'], 'Merge with next chapter');
+assert.equal(mergeButton.textContent, '');
+assert.equal(mergeButton.children[0].className, 'fas fa-compress-alt');
 assert(!source.includes('showModal'), 'Content editing never opens a popup');
 assert(source.includes("['chapters', 'slides', 'transcript']"));
 console.log('PASS: inline outline transforms preserve timing, text, source and chronological grouping');

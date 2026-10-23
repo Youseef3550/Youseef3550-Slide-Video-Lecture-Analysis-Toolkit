@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import json
 import os
 import sys
@@ -6,7 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 fastapi_module = sys.modules.setdefault("fastapi", ModuleType("fastapi"))
@@ -77,9 +78,9 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
             with mock.patch.object(TranscriptProcessor, "_process_whisper_transcript_sync") as process:
                 transcript_module._run_whisper_worker(
                     "vid", "video.mp4", str(working_dir / "vid_whisper.json"),
-                    True, [{"text": "Hallo"}],
+                    True, [{"text": "Hallo"}], speaker_mode="fast",
                 )
-                process.assert_called_once()
+                self.assertEqual(process.call_args.args[-1], "fast")
             self.assertTrue(backup.exists())
             self.assertEqual(progress.read_text(), "100")
             self.assertFalse((working_dir / "vid_whisper.json").exists())
@@ -205,10 +206,10 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
             transcript_module.transcribe_audio = self._unexpected_transcription
             try:
                 processor = TranscriptProcessor()
-                processor.apply_diarization = lambda path, transcript, **kwargs: (
+                processor.apply_diarization = mock.Mock(side_effect=lambda path, transcript, **kwargs: (
                     [{**item, "speaker": "SPEAKER_00"} for item in transcript],
                     {"SPEAKER_00": "Speaker 00"},
-                )
+                ))
                 output_path = Path(directory) / "video_whisper.json"
                 existing = [{"text": "Hello", "start": 0, "duration": 1}]
                 (Path(directory) / "video_whisper_progress.txt").write_text(
@@ -221,10 +222,17 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
                     str(output_path),
                     diarization=True,
                     existing_transcript=existing,
+                    speaker_mode="fast",
                 )
 
                 result = json.loads(output_path.read_text(encoding="utf-8"))
                 self.assertEqual(result[0]["speaker"], "SPEAKER_00")
+                self.assertEqual(
+                    [{key: value for key, value in item.items() if key != "speaker"} for item in result],
+                    existing,
+                )
+                self.assertEqual(processor.apply_diarization.call_args.kwargs["speaker_mode"], "fast")
+                self.assertEqual(processor._public_whisper_metadata("video")["speaker_mode"], "fast")
                 self.assertFalse(
                     (Path(directory) / "video_whisper_progress.txt").exists()
                 )
@@ -293,6 +301,33 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
         )
         self.assertFalse(response.content["success"])
 
+    def test_invalid_speaker_mode_does_not_stop_a_job(self):
+        processor = TranscriptProcessor()
+        with mock.patch.object(processor, "_terminate_whisper_process") as terminate:
+            for mode in ("quick", None, [], True):
+                response = asyncio.run(processor.generate_whisper_transcript(
+                    "video", None, force=True, speaker_mode=mode,
+                ))
+                self.assertFalse(response.content["success"])
+                self.assertIn("Unsupported speaker mode", response.content["error"])
+            terminate.assert_not_called()
+
+    def test_speaker_mode_is_queued_with_the_existing_transcript(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)), \
+                mock.patch.object(transcript_module, "VIDEO_DIR", Path(directory)):
+            root = Path(directory)
+            (root / "video.mp4").write_bytes(b"video")
+            (root / "video_whisper.json").write_text('[{"text":"Hello","start":0,"duration":1}]')
+            (root / "video_whisper_meta.json").write_text('{"model":"turbo"}')
+            tasks = mock.Mock()
+            result = asyncio.run(TranscriptProcessor().generate_whisper_transcript(
+                "video", tasks, speakers_only=True, speaker_mode="fast",
+            ))
+            self.assertTrue(result.content["success"])
+            self.assertEqual(tasks.add_task.call_args.args[-1], "fast")
+            self.assertEqual(tasks.add_task.call_args.args[5][0]["text"], "Hello")
+
     def test_online_model_without_key_is_rejected(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             response = asyncio.run(
@@ -333,6 +368,18 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
 
 
 class TranscriptProcessorIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_speaker_mode_is_forwarded_to_spawned_worker(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)), \
+                mock.patch.object(transcript_module.multiprocessing, "get_context") as context:
+            context.return_value.Process.return_value.exitcode = 0
+            await TranscriptProcessor().process_whisper_transcript(
+                "video", "video.mp4", "transcript.json", speaker_mode="fast",
+            )
+            arguments = context.return_value.Process.call_args.kwargs
+            self.assertIs(arguments["target"], transcript_module._run_whisper_worker)
+            self.assertEqual(arguments["args"][-1], "fast")
+
     async def test_native_worker_crash_becomes_status_error(self):
         class FailedProcess:
             exitcode = -9
@@ -513,6 +560,88 @@ class HuggingFaceTokenTests(unittest.TestCase):
 
 
 class PyannoteCompatibilityTests(unittest.TestCase):
+    def test_fast_mode_changes_actual_inference_step_without_gaps(self):
+        for mode, expected_step in (("standard", 1.0), ("fast", 5.0)):
+            with self.subTest(mode=mode):
+                inference = SimpleNamespace(step=1.0, duration=10.0)
+                pipeline = mock.Mock(
+                    _segmentation=inference, segmentation_step=0.1, embedding_batch_size=32,
+                )
+                torch_module = ModuleType("torch")
+                torch_module.cuda = mock.Mock()
+                torch_module.cuda.is_available.return_value = False
+                processor = TranscriptProcessor()
+                steps = []
+                with mock.patch.dict(sys.modules, {"torch": torch_module}), \
+                        mock.patch.object(processor, "_load_pyannote_pipeline", return_value=pipeline), \
+                        mock.patch.object(processor, "_load_audio_waveform", return_value="full audio"):
+                    processor._run_pyannote(object(), "hf", "video.mp4", steps.append, speaker_mode=mode)
+                self.assertEqual(inference.step, expected_step)
+                self.assertEqual(pipeline.segmentation_step, expected_step / inference.duration)
+                self.assertLessEqual(inference.step, inference.duration)
+                self.assertEqual(pipeline.call_args.args, ("full audio",))
+                self.assertEqual(any("short speaker changes may be less precise" in step for step in steps),
+                                 mode == "fast")
+
+    def test_invalid_mode_is_rejected_before_model_loading(self):
+        processor = TranscriptProcessor()
+        with mock.patch.object(processor, "_load_pyannote_pipeline") as load:
+            with self.assertRaisesRegex(ValueError, "Unsupported speaker mode"):
+                processor._run_pyannote(object(), "hf", "video.mp4", speaker_mode="quick")
+            load.assert_not_called()
+
+    def test_generate_route_passes_speaker_mode_and_defaults_to_standard(self):
+        source = Path(__file__).resolve().parents[1] / "main.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        route = next(node for node in tree.body
+                     if isinstance(node, ast.AsyncFunctionDef) and node.name == "generate_whisper_transcript")
+        route.decorator_list = []
+        processor = mock.Mock()
+        processor.generate_whisper_transcript = mock.AsyncMock(return_value="response")
+        namespace = {
+            "Request": object, "BackgroundTasks": object,
+            "json": json, "transcript_processor": processor,
+        }
+        exec(compile(ast.Module(body=[route], type_ignores=[]), str(source), "exec"), namespace)
+        for options, expected in (({"speakers_only": True, "speaker_mode": "fast"}, "fast"), ({}, "standard")):
+            request = mock.Mock(json=mock.AsyncMock(return_value=options))
+            result = asyncio.run(namespace["generate_whisper_transcript"]("video", request, object()))
+            self.assertEqual(result, "response")
+            self.assertEqual(processor.generate_whisper_transcript.call_args.kwargs["speaker_mode"], expected)
+
+    def test_cpu_embedding_batches_are_bounded_without_changing_gpu_batches(self):
+        for gpu, configured, expected in (
+            (False, 32, 4), (False, 2, 2), (True, 32, 32),
+        ):
+            with self.subTest(gpu=gpu, configured=configured):
+                torch_module = ModuleType("torch")
+                torch_module.cuda = mock.Mock()
+                torch_module.cuda.is_available.return_value = gpu
+                torch_module.device = mock.Mock(return_value="cuda")
+                annotation = object()
+                pipeline = mock.Mock(embedding_batch_size=configured)
+
+                def detect(audio, hook):
+                    self.assertEqual(audio, "decoded audio")
+                    hook("embeddings", total=8, completed=4)
+                    return type("Result", (), {"speaker_diarization": annotation})()
+
+                pipeline.side_effect = detect
+                steps = []
+                processor = TranscriptProcessor()
+                with mock.patch.dict(sys.modules, {"torch": torch_module}), \
+                        mock.patch.object(processor, "_load_pyannote_pipeline", return_value=pipeline), \
+                        mock.patch.object(processor, "_load_audio_waveform", return_value="decoded audio"):
+                    result = processor._run_pyannote(object(), "hf", "video.mp4", steps.append)
+                self.assertIs(result, annotation)
+                self.assertEqual(pipeline.embedding_batch_size, expected)
+                self.assertIn(f"Speaker embedding batch size: {expected}", steps)
+                self.assertIn("Detecting speakers: embeddings 50% (4/8 batches)", steps)
+                if gpu:
+                    pipeline.to.assert_called_once_with("cuda")
+                else:
+                    pipeline.to.assert_not_called()
+
     def test_uses_token_argument_for_pyannote_4(self):
         calls = []
 

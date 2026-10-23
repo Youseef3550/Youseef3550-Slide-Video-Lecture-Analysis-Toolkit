@@ -252,8 +252,14 @@ class EqualStrengthTransitionTests(unittest.TestCase):
     def test_minimum_duration_merges_quick_flips_and_reports_it(self):
         samples = self.samples(slide_count=6, seconds_per_slide=8)
         timestamps, diagnostics = self.select(samples, "balanced", minimum_duration=20)
-        self.assertLess(len(timestamps), 6)
-        self.assertEqual(diagnostics["limited_by"], ["minimum_slide_duration"])
+        self.assertEqual(timestamps, [0, 8, 16, 24, 32, 40])
+        self.assertEqual(diagnostics["short_replacements_preserved"], 5)
+        self.assertEqual(diagnostics["limited_by"], [])
+        options = {**detection_options("balanced", 20, 0), "preserve_slide_replacements": False}
+        legacy, legacy_diagnostics = SceneProcessor.__new__(SceneProcessor)._select_adaptive_timestamps(
+            samples, len(samples), options, [])
+        self.assertLess(len(legacy), 6)
+        self.assertEqual(legacy_diagnostics["limited_by"], ["minimum_slide_duration"])
 
     def test_static_frames_with_cursor_noise_stay_one_slide(self):
         base = np.full((72, 128), 245, np.uint8)

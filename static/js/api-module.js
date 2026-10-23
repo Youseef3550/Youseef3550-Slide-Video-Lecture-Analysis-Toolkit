@@ -10,9 +10,9 @@ import { updateChapters, clearChapterMarkers } from './chapters.js';
 import { checkSceneDetection, updateScenes, stopDetectionPolling } from './scenes.js';
 import { fetchOcrResults, resetOcrStatus } from './ocr.js';
 import { refreshTranscriptVersions } from './transcript-versions.js';
-import { startElapsedTimer } from './progress-time.js';
+import { startElapsedTimer, startProcessButton, finishProcessButton } from './progress-time.js';
 import { savedSummaryUrl } from './content-languages.js';
-import { loadProjectCaptionTracks } from './caption-export.js';
+import { loadProjectCaptionTracks, useVideoCopy, refreshVideoVersions } from './caption-export.js';
 
 // Translate backend transcript_source/active_language fields (set from the
 // persisted "active source" marker) into the state.currentTranscriptSource
@@ -34,9 +34,20 @@ function applyActiveTranscriptSource(data, videoId) {
     return savedSummaryUrl(videoId);
 }
 
+let activeTranscriptAction = null;
+
 export async function regenerateTranscript(options = {}) {
     const speakersOnly = options?.speakersOnly === true;
     const videoId = getActiveVideoId();
+    const button = speakersOnly ? document.getElementById('identifySpeakersBtn') : elements.regenerateTranscriptBtn;
+    if (activeTranscriptAction && !options.resumeOnly) {
+        if (activeTranscriptAction.videoId === videoId && activeTranscriptAction.button === button) {
+            await activeTranscriptAction.stop();
+        } else {
+            showNotification('Transcript processing is already running. Use its Stop button first.', 'info');
+        }
+        return;
+    }
     if (!videoId) {
         showError('Load a video before regenerating its transcript.');
         return;
@@ -45,10 +56,10 @@ export async function regenerateTranscript(options = {}) {
     const originalTranscript = state.currentTranscript.map((item) => ({ ...item }));
 
     const diarization = speakersOnly || elements.transcriptDiarization?.checked || false;
+    const speakerMode = document.getElementById('speakerMode')?.value || 'standard';
     const model = elements.transcriptModel?.value || '';
     if (model) sessionStorage.setItem('transcriptModelSessionV1', model);
     const prompt = elements.transcriptPrompt?.value.trim() || '';
-    const button = speakersOnly ? document.getElementById('identifySpeakersBtn') : elements.regenerateTranscriptBtn;
     const idleLabel = button?.textContent;
     if (button) {
         button.disabled = true;
@@ -56,9 +67,16 @@ export async function regenerateTranscript(options = {}) {
     }
     const pollGeneration = ++state.whisperTranscriptPollGeneration;
     const startedAt = Date.now();
-    renderWhisperProgress({ status: 'queued', progress: 0 }, startedAt);
+    renderWhisperProgress({ status: 'queued', progress: 0, pending_start: !options.resumeOnly }, startedAt, button);
     try {
         if (!options.resumeOnly) {
+        if (diarization && speakerMode === 'fast') {
+            const runtimeResponse = await fetch('/runtime_status');
+            const runtime = await readJsonResponse(runtimeResponse, 'Speaker mode availability');
+            if (!runtime.speaker_modes?.includes('fast')) {
+                throw new Error('Fast speaker mode needs a server restart. Let the current job finish or stop it first, then restart the server.');
+            }
+        }
         const response = await fetch(`/generate_whisper_transcript/${encodeURIComponent(videoId)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -68,6 +86,7 @@ export async function regenerateTranscript(options = {}) {
                 prompt,
                 force: true,
                 speakers_only: speakersOnly,
+                speaker_mode: speakerMode,
             })
         });
         const data = await readJsonResponse(response, 'Transcript regeneration');
@@ -107,12 +126,15 @@ export async function regenerateTranscript(options = {}) {
                 error.steps = status;
                 throw error;
             }
-            renderWhisperProgress(status, startedAt);
+            renderWhisperProgress(status, startedAt, button);
             const browse = document.getElementById('browseDuringTranscriptionBtn');
             if (browse) browse.onclick = () => {
                 state.whisperTranscriptPollGeneration++;
                 loadTranscript(originalTranscript);
+                finishProcessButton(button);
                 if (button) { button.disabled = false; button.textContent = idleLabel; }
+                activeTranscriptAction = null;
+                button?.removeAttribute('aria-busy');
                 showNotification('Processing continues in the background. You can choose a saved transcript above.', 'info');
             };
             await delay(3000);
@@ -135,6 +157,9 @@ export async function regenerateTranscript(options = {}) {
             `;
         }
     } finally {
+        finishProcessButton(button);
+        activeTranscriptAction = null;
+        button?.removeAttribute('aria-busy');
         if (button && state.whisperTranscriptPollGeneration === pollGeneration) {
             button.disabled = false;
             button.textContent = idleLabel;
@@ -172,7 +197,7 @@ export function renderTranscriptSteps(status, { running = true } = {}) {
     return `<ol class="transcript-steps">${items}</ol>`;
 }
 
-function renderWhisperProgress(status, startedAt) {
+function renderWhisperProgress(status, startedAt, initiatingButton = null) {
     const progress = Number.isFinite(Number(status.progress))
         ? Math.max(0, Math.min(100, Number(status.progress)))
         : 0;
@@ -190,38 +215,44 @@ function renderWhisperProgress(status, startedAt) {
         <div class="transcript-processing">
             <i class="fas fa-spinner fa-spin"></i>
             <div class="progress-container">
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: ${progress}%"></div>
-                </div>
-                <div class="progress-text">${Math.round(progress)}%</div>
+                ${status.phase === 'identifying_speakers'
+                    ? '<progress aria-label="Speaker identification in progress"></progress><div class="progress-text">Working - overall percentage unavailable</div>'
+                    : `
+                <progress max="100" value="${progress}" aria-label="Transcription progress"></progress>
+                <div class="progress-text">${Math.round(progress)}%</div>`}
             </div>
             <p>${phase}.${lastUpdate}</p>
             ${renderTranscriptSteps(status)}
-            <p>You can continue using slide detection and video controls while this runs.</p>
-            <button id="stopTranscriptionBtn" type="button" class="btn btn-danger">Stop processing</button>
+            <details class="contextual-help"><summary aria-label="Transcription progress help">?</summary><p>You can continue using slide detection and video controls while this runs. Use the stop icon on the running button to cancel processing.</p></details>
             <button id="browseDuringTranscriptionBtn" type="button" class="btn btn-secondary">Keep processing and view transcript</button>
         </div>
     `;
     startElapsedTimer(elements.transcriptContainer, elapsedSeconds);
-    const stop = document.getElementById('stopTranscriptionBtn');
-    if (stop) stop.onclick = async () => {
-        stop.disabled = true;
+    const button = initiatingButton || activeTranscriptAction?.button
+        || (status.phase === 'identifying_speakers' ? document.getElementById('identifySpeakersBtn') : elements.regenerateTranscriptBtn);
+    const process = startProcessButton(button, status.phase === 'identifying_speakers' ? 'Labeling speakers' : 'Generating transcript',
+        {cancellable: !status.pending_start, elapsedSeconds});
+    if (status.phase === 'transcribing') process.update({percent: progress});
+    activeTranscriptAction = {videoId: state.currentVideoId, button, stop: async () => {
+        process.update({stopping: true});
         try {
             const response = await fetch(`/cancel_whisper_transcript/${encodeURIComponent(state.currentVideoId)}`, {method: 'POST'});
             const data = await readJsonResponse(response, 'Stopping transcription');
             if (!data.success) throw new Error(data.error);
             state.whisperTranscriptPollGeneration++;
             loadTranscript(data.transcript || []);
+            finishProcessButton(button);
+            activeTranscriptAction = null;
             const regenerate = elements.regenerateTranscriptBtn;
             if (regenerate) { regenerate.disabled = false; regenerate.textContent = 'Regenerate transcript'; }
             const speakers = document.getElementById('identifySpeakersBtn');
-            if (speakers) { speakers.disabled = false; speakers.textContent = 'Identify speakers in the current transcript'; }
+            if (speakers) { speakers.disabled = false; speakers.textContent = 'Label speakers'; }
             showNotification('Processing stopped. Your previous transcript was preserved.', 'info');
         } catch (error) {
             showError(error.message);
-            stop.disabled = false;
+            process.update({stopping: false});
         }
-    };
+    }};
 }
 
 function delay(milliseconds) {
@@ -268,7 +299,7 @@ export function showTranscriptSourceInfo(source, metadata) {
             if (metadata.transcription_method) parts.push(metadata.transcription_method);
             parts.push(
                 metadata.diarization
-                    ? 'speakers identified'
+                    ? `speakers identified${metadata.speaker_mode === 'fast' ? ' (fast mode)' : ''}`
                     : metadata.diarization_error
                     ? `speaker identification failed: ${metadata.diarization_error}`
                     : 'no speaker identification'
@@ -406,9 +437,9 @@ export async function translateTranscript() {
     }
     const selectedModelLabel = elements.translationModel?.selectedOptions[0]?.textContent || 'Auto';
     const startedAt = Date.now();
+    const stopButtonElapsed = startProcessButton(button, 'Translating transcript');
     const updateElapsed = () => {
         const elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-        if (button) button.textContent = `Translating with ${selectedModelLabel}… ${elapsed}s`;
         if (elements.translationModelStatus) {
             elements.translationModelStatus.textContent =
                 `Translation requested: ${selectedModelLabel} (${elapsed}s elapsed).`;
@@ -429,8 +460,9 @@ export async function translateTranscript() {
             <div class="transcript-processing">
                 <i class="fas fa-spinner fa-spin"></i>
                 <p id="translationProgressText">Preparing translation with ${escapeHtml(selectedModelLabel)}...</p>
-                <div class="progress-bar"><div class="progress-fill" id="translationProgressFill" style="width: 0%"></div></div>
-                <p id="translationProgressDetail">The transcript and chapter titles are translated in parallel batches.</p>
+                <progress id="translationProgressFill" max="100" aria-label="Transcript translation progress"></progress>
+                <p id="translationProgressDetail" role="status"></p>
+                <details class="contextual-help"><summary aria-label="Translation progress help">?</summary><p>The transcript and chapter titles are translated in parallel batches.</p></details>
             </div>
         `;
         const progressText = document.getElementById('translationProgressText');
@@ -447,7 +479,9 @@ export async function translateTranscript() {
             const counts = Number.isFinite(done) && total ? ` \u2014 ${done} of ${total} lines` : '';
             progressText.textContent = `Translating (${elapsed}s)${counts}`;
             if (progressFill && total) {
-                progressFill.style.width = `${Math.min(100, Math.round((done / total) * 100))}%`;
+                const percent = Math.min(100, Math.round((done / total) * 100));
+                progressFill.value = percent;
+                stopButtonElapsed.update({percent});
             }
             if (progressDetail && latestProgress?.message) {
                 progressDetail.textContent = latestProgress.message;
@@ -520,6 +554,7 @@ export async function translateTranscript() {
             `Translation failed, so the original transcript was kept. ${error.message}`
         );
     } finally {
+        stopButtonElapsed();
         clearInterval(elapsedTimer);
         if (translationProgressTimer) clearInterval(translationProgressTimer);
         if (button) {
@@ -620,20 +655,32 @@ export function renderSpeakerNames(names = {}) {
         speakers.forEach((speaker) => {
             const row = document.createElement('label');
             row.className = 'speaker-name-row';
-            row.innerHTML = `<span>${speaker}</span>`;
+            const label = document.createElement('span');
+            label.textContent = speaker;
+            row.appendChild(label);
             const input = document.createElement('input');
             input.value = names[speaker] || speaker.replace(/_/g, ' ');
             input.setAttribute('aria-label', `Name for ${speaker}`);
             input.addEventListener('change', async () => {
-                updatedNames[speaker] = input.value.trim() || speaker;
-                const response = await fetch(`/speaker_names/${encodeURIComponent(state.currentVideoId)}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ names: updatedNames })
-                });
-                const data = await readJsonResponse(response, 'Saving speaker names');
-                showNotification('Speaker name saved.', 'success');
-                loadTranscript(state.currentTranscript.map((item) => ({ ...item, speaker_name: data.speaker_names[item.speaker] || item.speaker })));
+                const videoId = state.currentVideoId;
+                const transcript = state.currentTranscript;
+                input.disabled = true;
+                try {
+                    updatedNames[speaker] = input.value.trim() || speaker;
+                    const response = await fetch(`/speaker_names/${encodeURIComponent(videoId)}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ names: updatedNames })
+                    });
+                    const data = await readJsonResponse(response, 'Saving speaker names');
+                    if (state.currentVideoId !== videoId || state.currentTranscript !== transcript) return;
+                    showNotification('Speaker name saved.', 'success');
+                    loadTranscript(state.currentTranscript.map((item) => ({ ...item, speaker_name: data.speaker_names[item.speaker] || item.speaker })));
+                } catch (error) {
+                    showError(`Could not save speaker name: ${error.message}`);
+                } finally {
+                    input.disabled = false;
+                }
             });
             row.appendChild(input);
             panel.appendChild(row);
@@ -763,6 +810,9 @@ function getActiveVideoId() {
  * Resets all video-related states when loading a new video
  */
 function resetVideoStates() {
+    finishProcessButton(activeTranscriptAction?.button);
+    finishProcessButton(elements.detectScenesBtn);
+    activeTranscriptAction = null;
     if (state.youtubeTranscriptInterval) {
         clearInterval(state.youtubeTranscriptInterval);
         state.youtubeTranscriptInterval = null;
@@ -801,6 +851,8 @@ function resetVideoStates() {
     state.currentVideoId = null;
     state.currentVideoFilename = null;
     state.currentTranslationLanguage = null;
+    state.currentTranscriptSource = null;
+    state.currentTranscriptVersionId = null;
     document.dispatchEvent(new CustomEvent('videoSelectionChanged'));
     elements.videoPlayer.querySelectorAll('track[data-chapter-caption], track[data-caption-copy]').forEach(track => {
         track.track.mode = 'disabled';
@@ -914,6 +966,7 @@ export async function processVideo() {
             throw new Error(data.error || 'The server could not download this YouTube video.');
         }
         state.currentVideoId = data.video_id || videoId;
+        announceProjectOpened(state.currentVideoId, data.title || url);
         elements.exportChaptersBtn.disabled = false;
 
         // Set new source and wait for metadata to load
@@ -1094,6 +1147,7 @@ export async function processVideoUpload(file) {
         }
         state.currentVideoId = data.video_id;
         state.currentVideoFilename = file.name;
+        announceProjectOpened(data.video_id, file.name);
         await refreshTranscriptVersions();
         elements.exportChaptersBtn.disabled = false;
 
@@ -1258,7 +1312,11 @@ function uploadVideoWithProgress(formData) {
     });
 }
 
-export async function loadUploadedVideo(videoId) {
+export function announceProjectOpened(videoId, label = '') {
+    document.dispatchEvent(new CustomEvent('projectOpened', { detail: { videoId, label: label || '' } }));
+}
+
+export async function loadUploadedVideo(videoId, mediaExportId = null) {
     showError('');
     showLoading(true);
     elements.loadingIndicator.querySelector('p').textContent = 'Loading saved video...';
@@ -1290,7 +1348,9 @@ export async function loadUploadedVideo(videoId) {
         state.currentVideoId = data.video_id;
         state.currentVideoFilename = Array.from(document.getElementById('uploadedVideos')?.options || [])
             .find((option) => option.value === data.video_id)?.dataset.filename || null;
+        announceProjectOpened(data.video_id, state.currentVideoFilename);
         await loadProjectCaptionTracks(data.video_id, elements.videoPlayer);
+        refreshVideoVersions();
         await refreshTranscriptVersions();
         elements.detectScenesBtn.disabled = false;
         elements.exportChaptersBtn.disabled = false;
@@ -1324,8 +1384,15 @@ export async function loadUploadedVideo(videoId) {
         } else {
             elements.transcriptContainer.innerHTML = '<p>No transcript available for this video.</p>';
         }
+        if (mediaExportId && state.currentVideoId === videoId) {
+            if (!await useVideoCopy({id: mediaExportId})) {
+                throw new Error('Could not open the selected captioned variation. The original video is loaded.');
+            }
+        }
+        return true;
     } catch (error) {
         showError(`Error loading saved video: ${error.message}`);
+        return false;
     } finally {
         showLoading(false);
     }
@@ -1333,9 +1400,9 @@ export async function loadUploadedVideo(videoId) {
 
 // Mirrored by PRESET_LIMITS in tests/test_scene_processor.py.
 const DETAIL_LEVEL_LIMITS = {
-    more: { label: 'More slides', minimumDurationPercent: 0.25, maximumSlidesPerHour: 0 },
-    balanced: { label: 'Balanced', minimumDurationPercent: 0.5, maximumSlidesPerHour: 0 },
-    fewer: { label: 'Fewer slides', minimumDurationPercent: 1, maximumSlidesPerHour: 60 },
+    more: { label: 'Slides and every build', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
+    balanced: { label: 'Slides and major builds', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
+    fewer: { label: 'Slides only', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
 };
 
 function resolveSlideLimits(mode, detail) {
@@ -1359,7 +1426,7 @@ function describeAppliedSlideSettings(mode, detail, contentThreshold, limits) {
     const limit = limits.maximumSlidesPerHour
         ? `${limits.maximumSlidesPerHour} slides/hour`
         : 'no slide limit';
-    return `Method: ${method} ? minimum ${limits.minimumDurationPercent}% of video (${limits.durationSource}) ? ${limit} (${limits.limitSource}) ? similar-slide merging ${elements.mergeSimilarSlides.checked ? 'on' : 'off'}.`;
+    return `${method}; ${limit}.`;
 }
 
 export async function detectScenes() {
@@ -1389,7 +1456,7 @@ export async function detectScenes() {
     state.sceneDetectionThreshold = contentThreshold;
     localStorage.setItem('contentCutThresholdV1', String(contentThreshold));
     button.disabled = true;
-    button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Detecting Slides...';
+    startProcessButton(button, 'Detecting slides');
     state.sceneDetectionStartedAt = Date.now();
     // New detection replaces the slides, so OCR controls for the old slides no longer apply.
     document.getElementById('startOcrBtn')?.remove();
@@ -1408,6 +1475,7 @@ export async function detectScenes() {
                 minimum_slide_duration_percent: minimumDurationPercent,
                 maximum_slides_per_hour: maximumSlidesPerHour,
                 merge_similar_slides: elements.mergeSimilarSlides.checked,
+                preserve_slide_replacements: true,
                 include_chapter_boundaries: hasChapters && elements.includeChapterBoundaries.checked,
                 screenshot_height: screenshotHeight
             })
@@ -1424,6 +1492,7 @@ export async function detectScenes() {
         loadTranscriptOcrRelationships(videoId);
     } catch (error) {
         showError(`Error detecting scenes: ${error.message}`);
+        finishProcessButton(button);
         button.disabled = false;
         button.innerHTML = '<i class="fas fa-film"></i> Detect Slides';
     } finally {

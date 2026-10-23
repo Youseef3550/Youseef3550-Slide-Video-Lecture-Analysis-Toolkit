@@ -254,6 +254,11 @@ def list_versions(video_id):
         public = {key: value for key, value in entry.items() if key not in {"hash", "text_hash"}}
         public["label"] = _describe(entry)
         public["active_whisper"] = entry.get("kind") == "transcript" and entry.get("hash") == active
+        payload = _read_json(_versions_dir(video_id) / f"{entry['id']}.json", {})
+        chapters = payload.get("chapters")
+        if not chapters and public["active_whisper"]:
+            chapters = _read_json(SUMMARIES_DIR / f"{video_id}.json", [])
+        public["chapter_count"] = len(chapters) if isinstance(chapters, list) else 0
         versions.append(public)
     return versions
 

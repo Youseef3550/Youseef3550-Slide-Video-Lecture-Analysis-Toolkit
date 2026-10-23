@@ -208,7 +208,7 @@ class CaptionTests(unittest.TestCase):
                 time.sleep(0.1)
             self.assertEqual(state["status"], "complete", state)
             output = store.file(job_id, state["download_file"])
-            self.assertEqual(state["filename"], "lecture_EN caption.mp4")
+            self.assertRegex(state["filename"], r"^lecture_EN caption_\d{4}-\d{2}-\d{2}\.mp4$")
             self.assertAlmostEqual(asyncio.run(video_duration(output)), 3, delta=0.3)
             self.assertEqual(hashlib.sha256(original.read_bytes()).digest(), digest)
 

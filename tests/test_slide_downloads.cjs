@@ -22,6 +22,7 @@ function element() {
 }
 const context = vm.createContext({
     startElapsedTimer: () => () => {},
+    startProcessButton: require('./process_button_stub.cjs'),
     state, console,
     document: {createElement: element, getElementById: () => wordButton},
     contentLanguage: (_, __, language) => language || '',

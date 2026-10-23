@@ -7,11 +7,154 @@ import { updateActiveTranscript } from './transcript.js';
 import { navigationParts, activePart, conciseTitle, chapterStart, sceneTopicTitle, slideTitle } from './chapter-navigation.js';
 import { contentLanguage } from './content-languages.js';
 import { scrollWithinContainer } from './scroll-utils.js';
+import { outlineRanges, skipTarget } from './outline-ranges.js';
 import { updateActiveChapter } from './chapters.js';
+import { showError } from './ui.js';
+
+export function initPlaybackSpeed(player, select) {
+    const apply = () => {
+        const rate = Number(select.value);
+        try {
+            if (!Number.isFinite(rate) || rate < 0.25 || rate > 4) {
+                throw new Error('Choose a playback speed between 0.25 and 4.');
+            }
+            player.defaultPlaybackRate = rate;
+            if (player.playbackRate !== rate) player.playbackRate = rate;
+        } catch (error) {
+            select.value = String(player.playbackRate);
+            showError(`Could not change playback speed: ${error.message}`);
+        }
+    };
+    select.addEventListener('change', apply);
+    for (const event of ['loadedmetadata', 'loadstart']) player.addEventListener(event, apply);
+    player.addEventListener('ratechange', () => {
+        if (player.readyState === 0) return;
+        const rate = String(player.playbackRate);
+        if ([...select.options].some(option => option.value === rate)) {
+            select.value = rate;
+            if (player.defaultPlaybackRate !== player.playbackRate) player.defaultPlaybackRate = player.playbackRate;
+        }
+    });
+    apply();
+}
+
+export function initSecondJumps(player) {
+    const buttons = [['jumpBackSecondBtn', -1, 'seekBackInterval'], ['jumpForwardSecondBtn', 1, 'seekForwardInterval']]
+        .map(([id, delta, interval]) => [document.getElementById(id), delta, document.getElementById(interval)]);
+    let delay, repeat, held = null, suppressClick = null;
+    let seeking = false, painting = false, repeating = false, generation = 0;
+    const pending = [];
+    const step = interval => interval?.value === '60' ? 60 : 1;
+    const ready = () => Number.isFinite(player.duration) && player.duration > 0 && player.readyState >= 1;
+    const stop = () => {
+        clearTimeout(delay);
+        clearTimeout(repeat);
+        repeating = false;
+        held = null;
+    };
+    const scheduleRepeat = () => {
+        if (!held || !repeating || seeking || painting) return;
+        clearTimeout(repeat);
+        repeat = setTimeout(() => {
+            if (!held) return;
+            const [, delta, interval] = buttons.find(([button]) => button === held);
+            jump(delta, interval);
+        }, 150);
+    };
+    const seekNext = () => {
+        if (seeking || painting || player.seeking || !ready()) return;
+        const delta = pending.shift();
+        if (delta == null) { scheduleRepeat(); return; }
+        const target = Math.max(0, Math.min(player.duration, player.currentTime + delta));
+        if (target === player.currentTime) { pending.length = 0; stop(); return; }
+        seeking = true;
+        player.currentTime = target;
+    };
+    const jump = (delta, interval) => {
+        if (!ready()) return;
+        pending.push(delta * step(interval));
+        seekNext();
+    };
+    player.addEventListener('seeked', () => {
+        seeking = false;
+        if (painting) return;
+        painting = true;
+        const request = generation;
+        // Let the decoded destination frame paint before another seek replaces it.
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (request !== generation) return;
+            painting = false;
+            seekNext();
+        }));
+    });
+    const reset = () => {
+        stop();
+        ++generation;
+        pending.length = 0;
+        seeking = painting = false;
+    };
+    for (const name of ['emptied', 'loadstart', 'error']) player.addEventListener(name, reset);
+    const refresh = () => {
+        if (!ready()) stop();
+        buttons.forEach(([button, delta, interval]) => {
+            button.disabled = !ready();
+            if (interval) interval.disabled = !ready();
+            const label = `Jump ${delta < 0 ? 'backward' : 'forward'} ${step(interval) === 60 ? '1 minute' : '1 second'}`;
+            button.title = `${label} (hold to repeat)`;
+            button.setAttribute('aria-label', label);
+            const number = button.querySelector('.seek-jump-number');
+            if (number) number.textContent = step(interval) === 60 ? '1m' : '1s';
+        });
+    };
+    for (const [button, delta, interval] of buttons) {
+        const start = () => {
+            if (held || !ready()) return;
+            held = button;
+            suppressClick = button;
+            jump(delta, interval);
+            delay = setTimeout(() => {
+                repeating = true;
+                scheduleRepeat();
+            }, 400);
+        };
+        button.addEventListener('pointerdown', event => {
+            if (event.button !== 0) return;
+            button.setPointerCapture(event.pointerId);
+            start();
+        });
+        for (const name of ['pointerup', 'pointercancel', 'lostpointercapture', 'blur']) {
+            button.addEventListener(name, stop);
+        }
+        button.addEventListener('keydown', event => {
+            if (![' ', 'Enter'].includes(event.key)) return;
+            event.preventDefault();
+            if (!event.repeat) start();
+        });
+        button.addEventListener('keyup', event => {
+            if ([' ', 'Enter'].includes(event.key)) { event.preventDefault(); stop(); suppressClick = null; }
+        });
+        button.addEventListener('click', event => {
+            if (suppressClick === button && event.detail !== 0) { suppressClick = null; return; }
+            suppressClick = null;
+            jump(delta, interval);
+        });
+        interval?.addEventListener('change', () => {
+            stop();
+            for (const [, , other] of buttons) {
+                if (other) other.value = interval.value;
+            }
+            refresh();
+        });
+    }
+    window.addEventListener('blur', stop);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); });
+    for (const name of ['loadedmetadata', 'durationchange', 'emptied']) player.addEventListener(name, refresh);
+    refresh();
+}
 
 export function updateChapterCaptions() {
     const language = contentLanguage(state.currentVideoId, 'slides', state.currentTranslationLanguage);
-    const parts = navigationParts(state.videoChapters || [], state.videoScenes || [], state.chapterGrouping, language);
+    const parts = navigationParts(state.videoChapters || [], state.videoScenes || [], state.navigationKinds ?? state.chapterGrouping, language);
     const caption = document.getElementById('currentChapterTitle');
     if (caption) {
         const text = activePart(parts, elements.videoPlayer.currentTime)?.title
@@ -168,6 +311,14 @@ export function setupVideoPlayer(videoPlayer) {
 
     const navigationHandlers = {
         timeupdate: () => {
+            if (!videoPlayer.paused && !videoPlayer.seeking && Number.isFinite(videoPlayer.duration)) {
+                const target = skipTarget(outlineRanges(state.videoChapters, videoPlayer.duration),
+                    videoPlayer.currentTime, videoPlayer.duration);
+                if (target !== null) {
+                    if (target >= videoPlayer.duration) videoPlayer.pause();
+                    videoPlayer.currentTime = target;
+                }
+            }
             updateTimeMarker(videoPlayer);
             updateChapterCaptions();
             updateActiveChapter();

@@ -26,6 +26,7 @@ from processors import transcript_versions
 from audio_decoder import decode_audio_samples
 
 TRANSCRIPTION_MODELS = tuple(WHISPER_MODELS) + tuple(CLOUD_TRANSCRIPTION_MODELS)
+SPEAKER_MODES = ("standard", "fast")
 
 
 def default_transcription_model():
@@ -91,11 +92,11 @@ def read_transcript_steps(video_id, limit=60):
 
 def _run_whisper_worker(
     video_id, video_path, output_path, diarization, existing_transcript,
-    model="turbo", prompt=None,
+    model="turbo", prompt=None, speaker_mode="standard",
 ):
     TranscriptProcessor()._process_whisper_transcript_sync(
         video_id, video_path, output_path, diarization, existing_transcript,
-        model, prompt,
+        model, prompt, speaker_mode,
     )
 
 
@@ -223,12 +224,17 @@ class TranscriptProcessor:
 
     async def generate_whisper_transcript(
         self, video_id: str, background_tasks, diarization=False, force=False,
-        model="turbo", prompt=None, speakers_only=False,
+        model="turbo", prompt=None, speakers_only=False, speaker_mode="standard",
     ):
         """Generate a transcript using local Whisper or an online model.
 
         speakers_only identifies speakers in the existing transcript without transcribing again.
         """
+        if speaker_mode not in SPEAKER_MODES:
+            return JSONResponse({
+                "success": False,
+                "error": f"Unsupported speaker mode: {speaker_mode}",
+            })
         if speakers_only:
             if not (TRANSCRIPTS_DIR / f"{video_id}_whisper.json").is_file():
                 return JSONResponse({
@@ -355,6 +361,7 @@ class TranscriptProcessor:
                 existing_transcript,
                 model,
                 prompt,
+                speaker_mode,
             )
             
             return JSONResponse({
@@ -407,7 +414,7 @@ class TranscriptProcessor:
     async def process_whisper_transcript(
         self, video_id: str, video_path: str, output_path: str,
         diarization=False, existing_transcript=None, model="turbo",
-        prompt=None,
+        prompt=None, speaker_mode="standard",
     ):
         """Run native Whisper inference outside the FastAPI server process."""
         log_transcript_step(
@@ -424,6 +431,7 @@ class TranscriptProcessor:
                 existing_transcript,
                 model,
                 prompt,
+                speaker_mode,
             ),
             name=f"whisper-{video_id}",
         )
@@ -506,7 +514,7 @@ class TranscriptProcessor:
     def _process_whisper_transcript_sync(
         self, video_id: str, video_path: str, output_path: str,
         diarization=False, existing_transcript=None, model="turbo",
-        prompt=None,
+        prompt=None, speaker_mode="standard",
     ):
         """Blocking Whisper transcription and diarization, run off the event loop."""
         original_transcript = [
@@ -596,7 +604,7 @@ class TranscriptProcessor:
                 self._write_whisper_phase(video_id, "identifying_speakers")
                 try:
                     transcript, speaker_names = self.apply_diarization(
-                        video_path, transcript, on_step=step
+                        video_path, transcript, on_step=step, speaker_mode=speaker_mode
                     )
                 except Exception as error:
                     if original_transcript:
@@ -605,6 +613,11 @@ class TranscriptProcessor:
                     diarization_error = str(error)[:500]
                     step(f"Speaker identification failed; keeping the transcript: {error}")
             step(f"Saving the transcript (total {time.monotonic() - started:.0f}s)")
+            import content_history
+            history_before = content_history.capture(video_id)
+            backup = self._speaker_backup_path(video_id)
+            if backup.is_file():
+                history_before[str(Path(output_path).resolve())] = backup.read_bytes()
             with open(output_path, 'w') as f:
                 json.dump(transcript, f)
             previous_metadata = self._read_whisper_metadata(video_id)
@@ -629,6 +642,7 @@ class TranscriptProcessor:
                     "word_timestamps": not is_cloud_model(model),
                     "diarization": bool(diarization) and not diarization_error,
                     "diarization_error": diarization_error,
+                    "speaker_mode": speaker_mode if diarization else None,
                     "speaker_names": speaker_names,
                     "generated_at": generated_at,
                 }, f)
@@ -645,6 +659,7 @@ class TranscriptProcessor:
                 print(f"Could not store the transcript version: {error}")
 
             progress_file = str(TRANSCRIPTS_DIR / f"{video_id}_whisper_progress.txt")
+            content_history.record(video_id, "Label speakers" if original_transcript else "Generate transcript", history_before)
             heartbeat_stop.set()
             heartbeat.join(timeout=self.heartbeat_seconds + 1)
             if os.path.exists(progress_file):
@@ -802,7 +817,7 @@ class TranscriptProcessor:
             key: metadata.get(key)
             for key in (
                 "model", "prompt", "device", "transcription_method",
-                "diarization", "diarization_error", "generated_at",
+                "diarization", "diarization_error", "speaker_mode", "generated_at",
             )
         }
 
@@ -894,12 +909,23 @@ class TranscriptProcessor:
         samples = decode_audio_samples(video_path)
         return {"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": 16000}
 
-    def _run_pyannote(self, Pipeline, token, video_path, on_step=None):
+    def _run_pyannote(self, Pipeline, token, video_path, on_step=None, speaker_mode="standard"):
+        if speaker_mode not in SPEAKER_MODES:
+            raise ValueError(f"Unsupported speaker mode: {speaker_mode}")
         step = on_step or (lambda message: None)
         step("Loading the pyannote speaker model (the first use downloads it)")
         started = time.monotonic()
         pipeline = self._load_pyannote_pipeline(Pipeline, token)
         step(f"Speaker model loaded in {time.monotonic() - started:.0f}s")
+        if speaker_mode == "fast":
+            # pyannote has no pipeline setter for its inference window step.
+            inference = pipeline._segmentation
+            inference.step = max(inference.step, inference.duration * 0.5)
+            pipeline.segmentation_step = inference.step / inference.duration
+            step(
+                "Fast speaker mode: fewer overlapping windows, full audio coverage; "
+                "short speaker changes may be less precise"
+            )
         device = "CPU"
         try:
             import torch
@@ -909,6 +935,10 @@ class TranscriptProcessor:
                 device = "GPU"
         except Exception as error:
             print(f"Speaker identification will run on the CPU: {error}")
+        if device == "CPU":
+            # Large embedding batches hurt CPU throughput and increase peak memory.
+            pipeline.embedding_batch_size = min(pipeline.embedding_batch_size, 4)
+        step(f"Speaker embedding batch size: {pipeline.embedding_batch_size}")
         step("Decoding the audio for speaker detection")
         started = time.monotonic()
         audio = self._load_audio_waveform(video_path)
@@ -921,13 +951,22 @@ class TranscriptProcessor:
         reported = {}
 
         def hook(step_name, step_artifact=None, file=None, total=None, completed=None):
-            # Report each pyannote stage and every 10% within it, so long CPU runs show progress.
+            # Report real batch progress at most every five seconds within a stage.
             percent = min(100, int(100 * completed / total)) if total and completed is not None else None
             key = (step_name, None if percent is None else percent // 10)
-            if reported.get("key") != key:
+            now = time.monotonic()
+            advanced = completed is not None and completed != reported.get("completed")
+            if reported.get("key") != key or (advanced and now - reported.get("at", now) >= 5):
                 reported["key"] = key
+                reported["completed"] = completed
+                reported["at"] = now
                 label = str(step_name).replace("_", " ")
-                step(f"Detecting speakers: {label}" + (f" {percent}%" if percent is not None else ""))
+                progress = f" {percent}%" if percent is not None else ""
+                if total and completed is not None:
+                    progress += f" ({completed}/{total} batches)"
+                if step_name == "embeddings" and completed == 0:
+                    progress += " - preparing speaker samples; the first batch can take several minutes on CPU"
+                step(f"Detecting speakers: {label}" + progress)
 
         try:
             result = pipeline(audio, hook=hook)
@@ -940,7 +979,7 @@ class TranscriptProcessor:
         step(f"Speaker detection finished in {time.monotonic() - started:.0f}s")
         return annotation
 
-    def apply_diarization(self, video_path, transcript, on_step=None):
+    def apply_diarization(self, video_path, transcript, on_step=None, speaker_mode="standard"):
         """Assign pyannote speaker labels to Whisper segments by timestamp overlap."""
         token = get_huggingface_token()
         if not token:
@@ -959,7 +998,9 @@ class TranscriptProcessor:
                 "requirements and retry."
             ) from error
         try:
-            annotation = self._run_pyannote(Pipeline, token, video_path, on_step)
+            annotation = self._run_pyannote(
+                Pipeline, token, video_path, on_step, speaker_mode=speaker_mode
+            )
         except Exception as error:
             raise RuntimeError(
                 f"Speaker identification failed: {error}"

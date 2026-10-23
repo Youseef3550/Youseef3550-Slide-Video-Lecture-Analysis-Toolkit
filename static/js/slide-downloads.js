@@ -1,7 +1,7 @@
 import { state } from './main.js';
 import { showError } from './ui.js';
 import { saveBlobToUserLocation } from './utils.js';
-import { startElapsedTimer } from './progress-time.js';
+import { startProcessButton } from './progress-time.js';
 import { contentLanguage } from './content-languages.js';
 import { slideTitle, sceneTopicTitle } from './chapter-navigation.js';
 
@@ -58,7 +58,7 @@ async function saveSlideExport(url, filename, button, options) {
     const content = button.innerHTML;
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
-    const stopElapsed = startElapsedTimer(button);
+    const stopElapsed = startProcessButton(button, 'Downloading slides');
     try {
         const response = await fetch(url, options);
         if (!response.ok) {

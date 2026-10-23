@@ -32,7 +32,14 @@ export function navigationParts(chapters = [], scenes = [], mode = 'topic', lang
         };
     }).filter((part) => Number.isFinite(part.start));
     // Before chapters are generated, content mode falls back to slide changes so navigation still works.
-    const selected = mode === 'topic' ? (topics.length ? topics : slides)
+    const sections = chapters.flatMap(chapter => (chapter.sections || [])
+        .map(section => ({start: chapterStart(section), title: section.title})))
+        .filter(part => Number.isFinite(part.start));
+    const selected = Array.isArray(mode) ? [
+        ...(mode.includes('slides') ? slides : []),
+        ...(mode.includes('chapters') ? topics : []),
+        ...(mode.includes('sections') ? sections : []),
+    ] : mode === 'topic' ? (topics.length ? topics : slides)
         : mode === 'slides' ? slides : [...slides, ...topics];
     return [...new Map(selected.map((part) => [part.start, part])).values()].sort((a, b) => a.start - b.start);
 }

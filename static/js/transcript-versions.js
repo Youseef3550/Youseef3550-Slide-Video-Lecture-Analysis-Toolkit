@@ -55,7 +55,8 @@ function render() {
     if (!selected) {
         const placeholder = document.createElement('option');
         placeholder.value = '';
-        placeholder.textContent = state.currentTranscriptSource === 'youtube'
+        placeholder.textContent = state.currentVideoId && state.currentTranscript?.length
+            && state.currentTranscriptSource === 'youtube'
             ? 'YouTube captions (current)' : 'Saved transcripts…';
         element.append(placeholder);
     }
@@ -226,5 +227,10 @@ export function initTranscriptVersions() {
     document.addEventListener('transcriptUpdated', () => {
         if (!switching) state.currentTranscriptVersionId = null;
         scheduleRefresh();
+    });
+    document.addEventListener('videoSelectionChanged', () => {
+        ++refreshGeneration;
+        versions = [];
+        render();
     });
 }

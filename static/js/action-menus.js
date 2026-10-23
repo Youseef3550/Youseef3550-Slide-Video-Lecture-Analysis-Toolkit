@@ -1,5 +1,5 @@
 export function rowActions(row, label = 'Actions') {
-    let menu = row.querySelector(':scope > .action-menu');
+    let menu = row.querySelector(':scope > .action-menu:not(.download-menu)');
     if (!menu) {
         menu = document.createElement('details');
         menu.className = 'action-menu';
@@ -25,10 +25,6 @@ export function initActionMenus() {
             'edit-transcript-btn', 'transcriptOptionsBtn', 'openCaptionStyleBtn',
             'downloadTranscriptBtn', 'timestampToggle', 'fuzzySearchToggle',
         ]],
-        ['chapter-controls', 'Chapter actions', [
-            'edit-chapters-btn', 'enhanceChaptersBtn', 'summaryOptionsBtn',
-            'contentTranslationTarget', 'translateChaptersBtn', 'chapterSlidesToggle',
-        ]],
         ['slide-controls', 'Slide actions', [
             'edit-slides-btn', 'refreshSlideTitlesBtn', 'slideTranslationTarget', 'translateSlideTitlesBtn',
             'downloadScreenshotsBtn', 'downloadSlidesPdfBtn', 'downloadSlideTextWordBtn',
@@ -47,9 +43,30 @@ export function initActionMenus() {
             content.appendChild(outerLabel || element);
         }
     }
-    document.addEventListener('click', event => {
-        document.querySelectorAll('.action-menu[open]').forEach(menu => {
-            if (!menu.contains(event.target)) menu.open = false;
+    initOutsideDismiss();
+}
+
+export const POPUP_MENU_SELECTOR = 'details.action-menu, details.extra-options, details.contextual-help, details#navigationGrouping';
+
+export function initOutsideDismiss(root = document) {
+    if (root.__popupDismissReady) return;
+    root.__popupDismissReady = true;
+    // Capture phase so menus still close when a clicked control stops propagation.
+    root.addEventListener('pointerdown', event => {
+        if (event.button !== undefined && event.button !== 0) return;
+        const target = event.target;
+        root.querySelectorAll(POPUP_MENU_SELECTOR).forEach(menu => {
+            if (menu.open && !(target instanceof Node && menu.contains(target))) menu.open = false;
         });
-    });
+    }, true);
+    root.addEventListener('keydown', event => {
+        if (event.key !== 'Escape' || !(event.target instanceof Element)) return;
+        let menu = event.target.closest(POPUP_MENU_SELECTOR);
+        while (menu && !menu.open) menu = menu.parentElement?.closest(POPUP_MENU_SELECTOR);
+        if (!menu) return;
+        event.preventDefault();
+        event.stopPropagation();
+        menu.open = false;
+        menu.querySelector(':scope > summary')?.focus();
+    }, true);
 }

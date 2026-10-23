@@ -25,6 +25,9 @@ class ChapterToolsTests(unittest.TestCase):
         self.processor = SimpleNamespace(
             translate_transcript=mock.AsyncMock(side_effect=self.translate),
             enhance_chapters=mock.AsyncMock(side_effect=lambda chapters, *args: copy.deepcopy(chapters)),
+            review_disruptions=mock.AsyncMock(side_effect=lambda chapters, *args: copy.deepcopy(chapters)),
+            _verify_chapter_boundaries=mock.AsyncMock(side_effect=lambda chapters, *args: chapters),
+            _verify_section_boundaries=mock.AsyncMock(side_effect=lambda chapters, *args: chapters),
             _refresh_clients=mock.Mock(), _provider_chain=lambda *args, **kwargs: [("groq", "test")],
             _chapter_settings=lambda *args: {}, _summary_language_instruction=lambda language: language,
         )
@@ -69,6 +72,14 @@ class ChapterToolsTests(unittest.TestCase):
         self.assertEqual(json.loads((self.SUMMARIES_DIR / "vid.json").read_text()), self.chapters)
         self.assertEqual(json.loads((self.SUMMARIES_DIR / "vid_summary_en.json").read_text()), result)
 
+    def test_disruption_review_is_explicit_saved_and_does_not_verify_or_move_existing_boundaries(self):
+        result = self.action(operation="review")["content"]
+        self.assertEqual(result[1]["timestamp"], self.chapters[1]["timestamp"])
+        self.processor.review_disruptions.assert_awaited_once()
+        self.processor._verify_chapter_boundaries.assert_not_awaited()
+        self.processor._verify_section_boundaries.assert_not_awaited()
+        self.assertEqual(json.loads((self.SUMMARIES_DIR / "vid.json").read_text()), result)
+
     def test_translation_can_follow_open_transcript_or_choose_independent_language(self):
         self.write(self.TRANSCRIPTS_DIR / "vid_translated_en.json", self.transcript)
         self.assertEqual(self.action(transcript_language="en", target_language="transcript")["language"], "en")
@@ -107,8 +118,15 @@ class ChapterToolsTests(unittest.TestCase):
     def test_enhance_uses_existing_outline_not_transcript_regeneration(self):
         self.action(operation="enhance")
         self.processor.enhance_chapters.assert_awaited_once()
+        self.processor._verify_chapter_boundaries.assert_awaited_once()
+        self.processor._verify_section_boundaries.assert_awaited_once()
         self.processor.translate_transcript.assert_not_awaited()
         self.assertTrue(json.loads((self.SUMMARIES_DIR / "vid.json").read_text())[0]["user_edited"])
+
+    def test_enhance_verification_failure_preserves_saved_outline(self):
+        self.processor._verify_section_boundaries.side_effect = ValueError("Unsupported section evidence")
+        self.action(operation="enhance", status=502)
+        self.assertEqual(json.loads((self.SUMMARIES_DIR / "vid.json").read_text()), self.chapters)
 
     def test_editor_can_edit_independent_chapter_and_slide_languages(self):
         self.action(target_language="de")

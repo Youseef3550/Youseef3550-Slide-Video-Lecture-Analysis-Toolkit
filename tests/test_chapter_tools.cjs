@@ -6,8 +6,10 @@ const read = file => fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 
     .replace(/^import .*;\r?$/gm, '').replace(/^export /gm, '');
 const ids = {};
 for (const id of ['enhanceChaptersBtn', 'translateChaptersBtn', 'translateSlideTitlesBtn',
-    'contentTranslationTarget', 'slideTranslationTarget']) {
+    'contentTranslationTarget', 'slideTranslationTarget', 'confirmChapterTranslationBtn',
+    'chapterTranslationDialog', 'chapterTranslationContext']) {
     ids[id] = {textContent: id, value: 'transcript',
+        replaceChildren() {}, append() {}, close() {},
         addEventListener(event, callback) { this[event] = callback; }};
 }
 const storage = new Map();
@@ -22,14 +24,18 @@ const state = {
 let fail = false;
 let switchVideo = false;
 const context = vm.createContext({
+    startProcessButton: require('./process_button_stub.cjs'),
     state, elements: {generateSummaryBtn: {}}, console,
     localStorage: {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value),
         removeItem: key => storage.delete(key)},
-    document: {getElementById: id => ids[id], addEventListener(name, callback) { events[name] = callback; }},
+    document: {getElementById: id => ids[id], createElement: () => ({append() {}}),
+        addEventListener(name, callback) { events[name] = callback; }},
+    openOptionsDialog() {},
     updateChapters: content => { state.videoChapters = content; },
     updateScenes: content => { state.videoScenes = content; }, attachChapterSlides() {},
     startElapsedTimer: () => () => {}, showError: text => errors.push(text), showNotification() {},
     fetch: async (url, options) => {
+        if (!options) return {ok: true, json: async () => ({versions: []})};
         const body = JSON.parse(options.body);
         requests.push(body);
         if (switchVideo) state.currentVideoId = 'other';
@@ -49,8 +55,9 @@ context.initChapterTools();
     state.summaryGenerationInProgress = false;
     events.summaryGenerationChanged();
     assert.equal(ids.enhanceChaptersBtn.disabled, false, 'Actions re-enable after generation finishes');
-    ids.contentTranslationTarget.value = 'de';
     await ids.translateChaptersBtn.click();
+    ids.contentTranslationTarget.value = 'de';
+    await ids.confirmChapterTranslationBtn.click();
     assert.equal(requests[0].transcript_language, 'en');
     assert.equal(requests[0].language, 'en');
     assert.equal(requests[0].target_language, 'de');
@@ -67,11 +74,13 @@ context.initChapterTools();
     const prior = JSON.stringify(state.videoChapters);
     fail = true;
     await ids.translateChaptersBtn.click();
+    await ids.confirmChapterTranslationBtn.click();
     assert.equal(JSON.stringify(state.videoChapters), prior);
     assert.match(errors[0], /Provider unavailable/);
     fail = false;
     switchVideo = true;
     await ids.translateChaptersBtn.click();
+    await ids.confirmChapterTranslationBtn.click();
     assert.equal(context.contentLanguage('other', 'chapters', 'en'), 'en', 'A late response cannot set another video language');
     assert.equal(state.summaryGenerationInProgress, false);
     const template = fs.readFileSync(path.join(__dirname, '..', 'templates', 'index.html'), 'utf8');

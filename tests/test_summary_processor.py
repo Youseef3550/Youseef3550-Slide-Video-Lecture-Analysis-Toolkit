@@ -1,5 +1,8 @@
 import asyncio
+import ast
 import json
+import math
+import re
 import sys
 import unittest
 import tempfile
@@ -691,6 +694,99 @@ class SummaryProcessorTranslationTests(unittest.TestCase):
 
 
 class SummaryProviderFallbackTests(unittest.TestCase):
+    def test_same_slide_chapter_splits_become_sections_without_losing_text(self):
+        chapters = [
+            {"timestamp": "00:00", "title": "Introduction", "summary": "First summary"},
+            {"timestamp": "00:20", "title": "Example", "summary": "Example summary",
+             "sections": [{"timestamp": "00:20", "title": "Example detail", "point": "Preserved"}]},
+            {"timestamp": "01:00", "title": "New slide", "summary": "New subject"},
+            {"timestamp": "01:30", "title": "Continuation", "summary": "More details"},
+        ]
+        result = SummaryProcessor._respect_slide_chapters(chapters, [0, 60, 120])
+        self.assertEqual([chapter["timestamp"] for chapter in result], ["00:00", "01:00"])
+        self.assertEqual([section["timestamp"] for section in result[0]["sections"]], ["00:00", "00:20"])
+        self.assertIn("Preserved", result[0]["sections"][1]["point"])
+        self.assertIn("Example summary", result[0]["summary"])
+        self.assertEqual(result[1]["sections"][1]["title"], "Continuation")
+        self.assertEqual(len(chapters), 4, "Generation must not mutate source chapters")
+        flat = SummaryProcessor._respect_slide_chapters(chapters, [0], sectioned=False)
+        self.assertEqual(len(flat), 1)
+        self.assertNotIn("sections", flat[0])
+        self.assertIn("More details", flat[0]["summary"])
+
+    def test_slide_alignment_moves_overlapping_sections_and_survives_reload(self):
+        chapters = [
+            {"timestamp": "00:00", "title": "First", "sections": [
+                {"timestamp": "00:00", "title": "Intro", "point": "One"},
+                {"timestamp": "01:05", "title": "Early new-slide detail", "point": "Two"},
+            ]},
+            {"timestamp": "01:10", "title": "Second", "sections": [
+                {"timestamp": "01:10", "title": "Topic", "point": "Three"}]},
+        ]
+        result = SummaryProcessor._respect_slide_chapters(chapters, [0, 60.25])
+        self.assertEqual(result[1]["timestamp"], "00:01:00.250")
+        self.assertEqual(len(result[0]["sections"]), 1)
+        self.assertEqual(result[1]["sections"][0]["timestamp"], result[1]["timestamp"])
+        self.assertEqual([part["point"] for part in result[1]["sections"]], ["Two", "Three"])
+        processor = self._processor(None, None, None)
+        with tempfile.TemporaryDirectory() as temporary, mock.patch(
+                "processors.summary_processor.SUMMARIES_DIR", Path(temporary)):
+            (Path(temporary) / "video.json").write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(asyncio.run(processor.get_summary("video")).content["chapters"], result)
+
+    def test_slide_rules_apply_after_both_generation_pass_choices(self):
+        for passes in ("one", "two"):
+            processor = self._processor(None, None, None)
+            draft = [{"timestamp": "00:00", "title": "Main", "summary": "One"},
+                     {"timestamp": "00:10", "title": "Example", "summary": "Two"}]
+            processor._chunked_chapters = mock.AsyncMock(return_value=json.dumps(draft))
+            processor.enhance_chapters = mock.AsyncMock(return_value=draft)
+            processor._save_chapters = mock.Mock()
+            result = asyncio.run(processor.generate_summary(
+                [{"start": 0, "duration": 30, "text": "Lecture content"}],
+                "video", passes=passes, slide_starts=[0]))
+            self.assertTrue(result.content["success"])
+            self.assertEqual(len(result.content["chapters"]), 1)
+            self.assertEqual(len(result.content["chapters"][0]["sections"]), 2)
+            self.assertEqual(len(processor._save_chapters.call_args.args[1]), 1)
+
+    def test_generation_route_loads_saved_slide_boundaries_only_when_requested(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8"))
+        function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                        and node.name == "generate_summary")
+        function.decorator_list = []
+        processor = SimpleNamespace(generate_summary=mock.AsyncMock(return_value={"success": True}))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            namespace = {"SCENES_DIR": root, "json": json, "re": re, "math": math,
+                         "asyncio": asyncio, "summary_generation_tasks": {},
+                         "Request": object, "JSONResponse": lambda data: data, "summary_processor": processor}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), "<chapter-generation>", "exec"), namespace)
+            def generate(data):
+                return asyncio.run(namespace["generate_summary"](
+                    SimpleNamespace(json=mock.AsyncMock(return_value=data))))
+            result = generate({"video_id": "video", "consider_slides": True})
+            self.assertIn("Detect slides first", result["error"])
+            processor.generate_summary.assert_not_awaited()
+            (root / "video.json").write_text(json.dumps([
+                {"time_seconds": 60.25}, {"time_seconds": 0}, {"time_seconds": 60.25}]), encoding="utf-8")
+            self.assertTrue(generate({"video_id": "video", "consider_slides": True})["success"])
+            self.assertEqual(processor.generate_summary.call_args.kwargs["slide_starts"], [0, 60.25])
+            generate({"video_id": "video", "consider_slides": False})
+            self.assertIsNone(processor.generate_summary.call_args.kwargs["slide_starts"])
+            self.assertFalse(generate({"video_id": "../video", "consider_slides": True})["success"])
+            generate({"video_id": "video", "slide_boundary_scope": "both", "consider_slides": False})
+            options = processor.generate_summary.call_args.kwargs
+            self.assertIsNone(options["slide_starts"])
+            self.assertEqual(options["boundary_slide_starts"], [0, 60.25])
+            self.assertEqual(options["slide_boundary_scope"], "both")
+            self.assertFalse(generate({"video_id": "video", "basis": "speakers",
+                                       "slide_boundary_scope": "both"})["success"])
+            self.assertFalse(generate({"video_id": "video", "basis": "timestamps",
+                                       "slide_boundary_scope": "chapters"})["success"])
+            self.assertFalse(generate({"video_id": "video", "structure": "flat",
+                                       "slide_boundary_scope": "sections"})["success"])
+
     def test_whole_video_summary_uses_the_entire_transcript_and_one_paragraph(self):
         processor = self._processor(None, None, None)
         processor._complete = mock.Mock(return_value="The lecture explains the workflow.\n\nIt finishes with billing.")
@@ -813,6 +909,8 @@ class SummaryProviderFallbackTests(unittest.TestCase):
         processor._refresh_openai_client = lambda: None
         processor._refresh_groq_client = lambda: None
         processor._save_chapters = lambda *args: None
+        processor._verify_chapter_boundaries = mock.AsyncMock(side_effect=lambda chapters, *args: chapters)
+        processor._verify_section_boundaries = mock.AsyncMock(side_effect=lambda chapters, *args: chapters)
         return processor
 
     def test_summary_default_prefers_groq_and_preserves_explicit_choice(self):
@@ -1382,6 +1480,87 @@ class SummaryProviderFallbackTests(unittest.TestCase):
         self.assertIn("22m0.192s", response.content["error"])
         self.assertNotIn("add GROQ_API_KEY", response.content["error"])
         processor._save_chapters.assert_not_called()
+
+
+class TranscriptGapTests(unittest.TestCase):
+    def test_speaker_generation_applies_option_before_saving_and_defaults_off(self):
+        processor = SummaryProcessor.__new__(SummaryProcessor)
+        processor._save_chapters = mock.Mock()
+        transcript = [{"start": 0, "duration": 5, "text": "One", "speaker": "A"},
+                      {"start": 20, "duration": 5, "text": "Two", "speaker": "A"}]
+        with mock.patch("processors.summary_processor.JSONResponse", side_effect=lambda data: data):
+            result = asyncio.run(processor.generate_summary(
+                transcript, "video", basis="speakers", flag_transcript_gaps=True))
+            self.assertTrue(result["success"], result)
+            self.assertTrue(result["chapters"][0]["sections"][1]["transcript_gap"])
+            self.assertEqual(processor._save_chapters.call_args.args[1], result["chapters"])
+            result = asyncio.run(processor.generate_summary(transcript, "video", basis="speakers"))
+            self.assertNotIn("sections", result["chapters"][0])
+            for threshold in (True, 0, 301, float("nan")):
+                result = asyncio.run(processor.generate_summary(
+                    transcript, "video", basis="speakers", transcript_gap_seconds=threshold))
+                self.assertFalse(result["success"])
+
+    def test_threshold_overlap_resume_and_chapter_boundaries(self):
+        chapters = [
+            {"timestamp": "00:00", "title": "First", "sections": [
+                {"timestamp": "00:00", "title": "A", "point": "Alpha"},
+                {"timestamp": "00:15", "title": "B", "point": "Beta"}]},
+            {"timestamp": "00:25", "title": "Second", "summary": "Second summary"},
+        ]
+        transcript = [
+            {"start": 0, "duration": 5, "text": "Opening"},
+            {"start": 3, "duration": 4, "text": "Overlapping cue"},
+            {"start": 17, "duration": 3, "text": "Next"},
+            {"start": 20, "duration": 0, "text": "   "},
+            {"start": 35, "duration": 5, "text": "Return"},
+        ]
+        original = json.dumps(chapters)
+        saved = SummaryProcessor._separate_transcript_gaps(chapters, transcript, 10)
+        self.assertEqual(json.dumps(chapters), original)
+        self.assertEqual([c["timestamp"] for c in saved], ["00:00", "00:25"])
+        rows = saved[0]["sections"]
+        self.assertEqual([SummaryProcessor._timestamp_value(s["timestamp"]) for s in rows], [0, 7, 17, 20])
+        self.assertEqual(rows[2]["title"], "B")
+        self.assertEqual(rows[2]["point"], "Beta")
+        second = saved[1]["sections"]
+        self.assertEqual([SummaryProcessor._timestamp_value(s["timestamp"]) for s in second], [25, 35])
+        self.assertEqual(second[1]["title"], "Second")
+        gaps = [s for c in saved for s in c["sections"] if s.get("transcript_gap")]
+        self.assertEqual(len(gaps), 3)
+        self.assertTrue(all(s["flagged"] and not s["skipped"] for s in gaps))
+        self.assertTrue(all(s["title"] == "No transcript text" for s in gaps))
+
+    def test_short_gaps_unchanged_and_known_duration_includes_tail(self):
+        chapters = [{"timestamp": "00:00", "title": "Topic"}]
+        transcript = [{"start": 0, "duration": 5, "text": "A"}, {"start": 14.9, "duration": 5, "text": "B"}]
+        self.assertEqual(SummaryProcessor._separate_transcript_gaps(chapters, transcript, 10), chapters)
+        saved = SummaryProcessor._separate_transcript_gaps(chapters, transcript, 10, 30)
+        self.assertEqual(len(saved[0]["sections"]), 2)
+        self.assertAlmostEqual(SummaryProcessor._timestamp_value(saved[0]["sections"][1]["timestamp"]), 19.9)
+        self.assertTrue(saved[0]["sections"][1]["transcript_gap"])
+
+
+class MergedSectionDescriptionTests(unittest.TestCase):
+    def test_combined_description_requests_every_sections_topics_and_information(self):
+        processor = SummaryProcessor.__new__(SummaryProcessor)
+        processor._refresh_clients = mock.Mock()
+        processor._provider_chain = mock.Mock(return_value=[("groq", "test-model")])
+        processor._complete = mock.Mock(return_value=json.dumps({
+            "title": "Architecture and deployment",
+            "summary": "The architecture separates services. Deployment uses staged releases.",
+        }))
+        result = asyncio.run(processor.summarize_outline_part([
+            {"text": "Section 1: Architecture\nThe architecture separates services."},
+            {"text": "Section 2: Deployment\nDeployment uses staged releases."},
+        ], "en", combined=True))
+        prompt = processor._complete.call_args.args[2]
+        self.assertIn("across all supplied sections, not just the first", prompt)
+        self.assertIn("every supplied section in chronological order", prompt)
+        self.assertIn("Section 1: Architecture", prompt)
+        self.assertIn("Section 2: Deployment", prompt)
+        self.assertEqual(result["title"], "Architecture and deployment")
+        self.assertIn("staged releases", result["summary"])
 
 
 if __name__ == "__main__":

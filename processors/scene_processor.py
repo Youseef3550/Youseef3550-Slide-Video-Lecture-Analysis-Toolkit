@@ -115,6 +115,8 @@ class SceneProcessor:
         scene_path = SCENES_DIR / f"{video_id}.json"
         diagnostics_path = SCENES_DIR / f"{video_id}_diagnostics.json"
         error_path = SCENES_DIR / f"{video_id}_error.txt"
+        from .scene_history import archive
+        await asyncio.to_thread(archive, video_id)
         if scene_path.exists():
             scene_path.unlink()
         if diagnostics_path.exists():
@@ -149,6 +151,8 @@ class SceneProcessor:
 
             # Generate scene images and object detections, but leave OCR opt-in.
             await self.process_scene_images(video_id)
+            from .scene_history import archive
+            await asyncio.to_thread(archive, video_id)
                 
         except Exception as e:
             print(f"Error in background scene detection: {str(e)}")
@@ -326,7 +330,7 @@ class SceneProcessor:
             if fps <= 0 or frame_count <= 0:
                 raise ValueError("Could not read video frame rate or frame count")
 
-            sample_interval_seconds = max(1.0, min(2.0, duration_seconds / 3600))
+            sample_interval_seconds = 1.0
             sample_step = max(1, int(round(fps * sample_interval_seconds)))
             samples = []
             frame_number = 0
@@ -406,6 +410,7 @@ class SceneProcessor:
         preset = ADAPTIVE_PRESETS[detail]
         merge_similar = options["merge_similar_slides"]
         minimum_duration = options["minimum_slide_duration"]
+        preserve_replacements = options.get("preserve_slide_replacements", True)
         change_threshold = (
             preset["change_threshold"] if merge_similar else DUPLICATE_CHANGE_FRACTION
         )
@@ -418,6 +423,7 @@ class SceneProcessor:
         small_changes_merged = 0
         builds_merged = 0
         merged_by_minimum_duration = 0
+        replacements_preserved = 0
         for index in range(1, len(samples)):
             timestamp, signature = samples[index]
             if self._change_fraction(state, signature, mask) < NOISE_CHANGE_FRACTION:
@@ -441,14 +447,19 @@ class SceneProcessor:
                 builds_merged += 1
                 reference = signature
                 continue
+            replacement = not self._is_additive_change(reference, signature, mask)
             reference = signature
             previous = selected[-1]
-            if timestamp - previous["time"] < minimum_duration:
+            separation = timestamp - previous["time"]
+            preserve = preserve_replacements and replacement and separation >= MINIMUM_SLIDE_DURATION_FLOOR
+            if separation < minimum_duration and not preserve:
                 merged_by_minimum_duration += 1
-                if previous["time"] > 0:
+                if not preserve_replacements and previous["time"] > 0:
                     previous["time"] = timestamp
                     previous["strength"] = max(previous["strength"], novelty)
                 continue
+            if preserve and separation < minimum_duration:
+                replacements_preserved += 1
             selected.append({"time": timestamp, "strength": novelty})
 
         visual_timestamps = [round(item["time"], 3) for item in selected]
@@ -487,6 +498,8 @@ class SceneProcessor:
             "small_changes_merged": small_changes_merged,
             "builds_merged": builds_merged,
             "merged_by_minimum_duration": merged_by_minimum_duration,
+            "preserve_slide_replacements": preserve_replacements,
+            "short_replacements_preserved": replacements_preserved,
             "removed_by_slide_limit": removed_by_limit,
             "limited_by": limited_by,
             "chapter_boundaries_added": len(chapter_timestamps),

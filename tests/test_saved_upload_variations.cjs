@@ -10,12 +10,13 @@ const read = name => fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 
     const versionContainer = {};
     const brand = {};
     const projectHistory = {};
-    const children = [projectHistory, versionContainer, brand];
+    const extraOptions = {};
+    const children = [projectHistory, versionContainer, brand, extraOptions];
     Object.defineProperty(versionContainer, 'nextSibling', {get: () => children[children.indexOf(versionContainer) + 1]});
     Object.defineProperty(projectHistory, 'nextSibling', {get: () => children[children.indexOf(projectHistory) + 1]});
     const inputSection = {
         get firstChild() { return children[0]; },
-        querySelector: selector => selector.includes('project-history-controls') ? projectHistory : null,
+        querySelector: selector => selector === '#extraOptionsMenu' ? extraOptions : null,
         insertBefore(child, reference) { children.splice(children.indexOf(reference), 0, child); },
     };
     const layout = vm.createContext({
@@ -31,9 +32,10 @@ const read = name => fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 
     vm.runInContext(read('index.js'), layout);
     layout.initExampleVideos();
     assert.equal(children[0], projectHistory, 'Project Back/Next stays first');
-    assert.match(children[1].innerHTML, /id="uploadedVideos"/);
-    assert.equal(children[2], versionContainer, 'Video version follows Saved uploads');
-    assert.match(children[3].innerHTML, /id="exampleVideos"/, 'Examples follows Video version');
+    assert.equal(children[1], versionContainer, 'Video version keeps its position');
+    assert.match(children[2].innerHTML, /id="exampleVideos"/, 'Examples follows Video version');
+    assert.match(children[children.indexOf(extraOptions) - 1].innerHTML, /id="uploadedVideos"/,
+        'Saved uploads is immediately before Extra options');
     const screenshotButton = template.match(/<button id="takeScreenshotBtn"[\s\S]*?<\/button>/)[0];
     assert.match(screenshotButton, /aria-label="Take screenshot"/);
     assert.match(screenshotButton, /fa-camera/);

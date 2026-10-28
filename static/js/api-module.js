@@ -1400,9 +1400,9 @@ export async function loadUploadedVideo(videoId, mediaExportId = null) {
 
 // Mirrored by PRESET_LIMITS in tests/test_scene_processor.py.
 const DETAIL_LEVEL_LIMITS = {
-    more: { label: 'Slides and every build', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
-    balanced: { label: 'Slides and major builds', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
-    fewer: { label: 'Slides only', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
+    more: { label: 'Slide changes and every addition', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
+    balanced: { label: 'Slide changes and major variations', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
+    fewer: { label: 'Slide changes only', minimumDurationPercent: 0, maximumSlidesPerHour: 0 },
 };
 
 function resolveSlideLimits(mode, detail) {

@@ -70,8 +70,7 @@ async function initUploadedVideos(inputSection) {
     const container = document.createElement('div');
     container.className = 'example-videos-container';
     container.innerHTML = '<select id="uploadedVideos" class="example-videos-select" title="Select a previously uploaded video"><option value="">Saved uploads ▾</option></select>';
-    const historyControls = inputSection.querySelector(':scope > .project-history-controls');
-    inputSection.insertBefore(container, historyControls ? historyControls.nextSibling : inputSection.firstChild);
+    inputSection.insertBefore(container, inputSection.querySelector('#extraOptionsMenu'));
     const select = container.querySelector('#uploadedVideos');
     try {
         const response = await fetch('/uploaded_videos');

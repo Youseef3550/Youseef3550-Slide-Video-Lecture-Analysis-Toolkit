@@ -630,7 +630,6 @@ function setSummaryStatus(state, message) {
         status.setAttribute('role', 'status');
         status.setAttribute('aria-live', 'polite');
         elements.chaptersContainer.prepend(status);
-        elements.summaryStatus = status;
     }
 
     status.className = `summary-status summary-status-${state.split(' ')[0]}`;

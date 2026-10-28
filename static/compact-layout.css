@@ -952,6 +952,41 @@ input:checked + .toggle-slider:before {
     margin-block: 4px;
 }
 
+.help-option {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    position: relative;
+    min-width: 0;
+    max-width: 100%;
+}
+.help-option > :first-child { min-width: 0; }
+.help-option > label { flex: 1; margin-block: 0; }
+.help-option > details.contextual-help {
+    flex: 0 0 24px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+}
+.contextual-help > .help-content {
+    position: absolute;
+    z-index: 20;
+    box-sizing: border-box;
+    inset-inline-start: 0;
+    top: 100%;
+    width: min(360px, 100%);
+    min-width: min(260px, calc(100vw - 32px));
+    max-height: 240px;
+    overflow: auto;
+    padding: 12px;
+    background: var(--surface-1, #fff);
+    color: var(--text-primary, #222);
+    border: 1px solid var(--border, #ccc);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px #0002;
+}
+.contextual-help:not([open]) > .help-content { display: none; }
+
 .contextual-help > summary {
     display: inline-grid;
     place-items: center;

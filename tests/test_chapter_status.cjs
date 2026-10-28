@@ -30,4 +30,23 @@ assert.equal(status.hidden, false);
 context.setSummaryStatus('complete', 'Saved again');
 assert.equal(status.hidden, false);
 assert.equal(timers.size, 1);
+let createdStatus = null;
+const lazyElements = {
+    get summaryStatus() { return createdStatus; },
+    chaptersContainer: { prepend(node) { createdStatus = node; } },
+};
+const lazyContext = vm.createContext({
+    elements: lazyElements,
+    document: { createElement: () => ({ setAttribute() {} }) },
+    setTimeout() { return 1; },
+    clearTimeout() {},
+});
+vm.runInContext("'use strict';\n" + source, lazyContext);
+assert.doesNotThrow(() => lazyContext.setSummaryStatus('generating', 'Starting'),
+    'Creating status must not assign to the getter-only elements registry');
+assert.equal(createdStatus.id, 'summaryStatus');
+assert.equal(createdStatus.innerHTML, 'Starting');
+const originalStatus = createdStatus;
+lazyContext.setSummaryStatus('error', 'Provider failed');
+assert.equal(createdStatus, originalStatus, 'Subsequent updates reuse the created status');
 console.log('PASS: chapter success expires after 5s; running and error states persist');

@@ -970,9 +970,15 @@ Chapter and section rows cannot be mixed in one merge. Delete
 removes selected section labels after confirmation, not original footage.
 Both actions preserve expanded chapters and summaries and reject stale edits.
 Routine editing disclaimers and instructions are collapsed behind contextual
-question marks. Help uses a quiet 13 px glyph in a 24 px target, descriptive
+question marks beside the corresponding option label or control, not on separate
+lines. Expanded help appears in a dismissible panel. Help uses a quiet 13 px
+glyph in a 24 px target, descriptive
 accessible labels, keyboard focus styling, and click/tap disclosure rather than
 hover-only tooltips. Escape closes help and returns focus to its trigger.
+Chapter and section boundary verification checks transcript cue IDs and exact
+supporting quotes. An invalid verification response gets one targeted correction
+attempt for that batch, without regenerating the outline or accepting guessed
+timestamps. If evidence still fails validation, existing saved chapters are kept.
 Row editing keeps the optional Review reason field collapsed by default;
 existing saved review notes remain available and are preserved when saving.
 Start and End fields include pin buttons (**Start here** / **End here**) to
@@ -1209,8 +1215,10 @@ ocr_text = requests.get("http://localhost:8000/find_ocr_for_transcript/video_id/
 #### Scene Detection and Analysis
 - **Adaptive Detection**: Finds settled slide states and ignores cursor movement,
   compression noise and constantly moving regions such as webcam insets. Full
-  slide replacements are preserved at every detail level. Choose **Slides only**,
-  **Slides and major builds**, or **Slides and every build**. Defaults use a
+  slide replacements are preserved at every detail level. Choose **Slide changes only**,
+  **Slide changes and major variations**, or **Slide changes and every addition**.
+  Additions are bullet points, text or diagrams appearing step by step on the
+  same slide (also called slide builds). Defaults use a
   two-second floor and no slide-count cap, with one-second sampling. Advanced
   build-duration filters no longer erase short full replacements or move earlier
   starts forward. An explicit count cap can still hide slides. Brief flashes,

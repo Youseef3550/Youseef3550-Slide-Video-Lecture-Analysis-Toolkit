@@ -616,7 +616,7 @@ function initApp() {
         elements.visualDetectionOptions.hidden = mode === 'chapters';
         elements.includeChapterBoundariesLabel.hidden = mode === 'chapters';
         elements.sceneDetectionHelp.textContent = mode === 'adaptive'
-            ? 'Adaptive mode finds settled slide states, ignores cursor and webcam movement, and merges builds according to the detail level.'
+            ? 'Adaptive mode finds settled slide states, ignores cursor and webcam movement, and combines step-by-step additions according to the detail level.'
             : mode === 'content'
                 ? 'Content cuts detect abrupt visual transitions using the separate PySceneDetect threshold above.'
                 : 'Uses existing transcript chapter timestamps without scanning the complete video.';

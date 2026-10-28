@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import math
 import re
 import asyncio
@@ -23,6 +24,8 @@ from translation_services import (
 )
 from translation_checkpoint import TranslationCheckpointError
 from video_ranges import split_ranges
+
+logger = logging.getLogger(__name__)
 
 # Gemini's free-tier quotas are counted per model, so another model often
 # still has quota when the selected one is exhausted.
@@ -1975,25 +1978,50 @@ class SummaryProcessor:
                 '"opening_quote":"exact words from that utterance"}]}. No invented timestamps.\n'
                 + json.dumps(batch, ensure_ascii=False)
             )
-            text = await asyncio.wait_for(
-                asyncio.to_thread(self._complete, provider, model, prompt, 0, True, 3000, True),
-                timeout=CHAPTER_TIMEOUT_SECONDS,
-            )
-            data = json.loads(re.sub(r"^```(?:json)?|```$", "", (text or "").strip()).strip())
-            decisions = data.get("boundaries") if isinstance(data, dict) else None
-            if not isinstance(decisions, list) or len(decisions) != len(batch):
-                raise ValueError(f"{kind.capitalize()} boundary verification omitted or added decisions.")
-            for request, decision in zip(batch, decisions):
-                index = request[index_key]
-                if (not isinstance(decision, dict) or type(decision.get(index_key)) is not int
-                        or decision[index_key] != index or type(decision.get("transcript_id")) is not int):
-                    raise ValueError(f"{kind.capitalize()} boundary verification returned invalid or reordered IDs.")
-                cue = candidates[index].get(decision["transcript_id"])
-                quote = decision.get("opening_quote")
-                if cue is None or not isinstance(quote, str) or not quote.strip() or quote not in cue["text"]:
-                    raise ValueError(f"{kind.capitalize()} boundary verification returned unsupported transcript evidence.")
-                chosen[index] = (cue["start"], {"transcript_id": cue["id"], "opening_quote": quote})
+            retry_prompt = prompt
+            for attempt in range(2):
+                text = await asyncio.wait_for(
+                    asyncio.to_thread(self._complete, provider, model, retry_prompt, 0, True, 3000, True),
+                    timeout=CHAPTER_TIMEOUT_SECONDS,
+                )
+                try:
+                    verified = self._validate_boundary_decisions(text, batch, candidates, kind)
+                except ValueError as error:
+                    if attempt:
+                        raise
+                    logger.warning("Retrying %s boundary evidence verification: %s", kind, error)
+                    retry_prompt = (
+                        prompt + "\nThe previous verification response failed validation: " + str(error)
+                        + "\nReturn a corrected complete JSON response for this batch. "
+                        "Use the supplied global transcript IDs, not positions within an excerpt. "
+                        "Copy opening_quote character-for-character from that exact ID's text; "
+                        "do not translate, paraphrase, change punctuation, or combine utterances. "
+                        "Do not repeat the invalid response.\nPrevious response:\n" + str(text)
+                    )
+                else:
+                    chosen.update(verified)
+                    break
         return chosen
+
+    @staticmethod
+    def _validate_boundary_decisions(text, batch, candidates, kind):
+        index_key = f"{kind}_index"
+        data = json.loads(re.sub(r"^```(?:json)?|```$", "", (text or "").strip()).strip())
+        decisions = data.get("boundaries") if isinstance(data, dict) else None
+        if not isinstance(decisions, list) or len(decisions) != len(batch):
+            raise ValueError(f"{kind.capitalize()} boundary verification omitted or added decisions.")
+        verified = {}
+        for request, decision in zip(batch, decisions):
+            index = request[index_key]
+            if (not isinstance(decision, dict) or type(decision.get(index_key)) is not int
+                    or decision[index_key] != index or type(decision.get("transcript_id")) is not int):
+                raise ValueError(f"{kind.capitalize()} boundary verification returned invalid or reordered IDs.")
+            cue = candidates[index].get(decision["transcript_id"])
+            quote = decision.get("opening_quote")
+            if cue is None or not isinstance(quote, str) or not quote.strip() or quote not in cue["text"]:
+                raise ValueError(f"{kind.capitalize()} boundary verification returned unsupported transcript evidence.")
+            verified[index] = (cue["start"], {"transcript_id": cue["id"], "opening_quote": quote})
+        return verified
 
     @staticmethod
     def _timestamp_or_none(value):

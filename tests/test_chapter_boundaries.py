@@ -133,6 +133,29 @@ class ChapterBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap"):
             self.verify()
 
+    def test_invalid_evidence_is_repaired_without_regenerating_outline(self):
+        invalid = deepcopy(self.decisions)
+        invalid[1]["opening_quote"] = "Paraphrased demo introduction"
+        self.processor._complete.side_effect = [
+            json.dumps({"boundaries": invalid}),
+            json.dumps({"boundaries": self.decisions}),
+        ]
+        result = self.verify()
+        self.assertEqual(result[1]["timestamp"], "04:39.840")
+        self.assertEqual(self.processor._complete.call_count, 2)
+        prompt = self.processor._complete.call_args.args[2]
+        self.assertIn("global transcript IDs", prompt)
+        self.assertIn("character-for-character", prompt)
+        self.assertIn("unsupported transcript evidence", prompt)
+
+    def test_persistent_invalid_evidence_has_only_one_correction_attempt(self):
+        self.processor._complete.return_value = json.dumps({"boundaries": [
+            self.decisions[0], {**self.decisions[1], "transcript_id": 999},
+        ]})
+        with self.assertRaisesRegex(ValueError, "unsupported transcript evidence"):
+            self.verify()
+        self.assertEqual(self.processor._complete.call_count, 2)
+
     def test_missing_transcript_evidence_fails_instead_of_saving_a_guessed_start(self):
         self.transcript = self.transcript[:1]
         with self.assertRaisesRegex(ValueError, "No transcript evidence"):

@@ -264,6 +264,7 @@
                 </div>
                 <p id="currentChapterTitle" class="chapter-caption" aria-live="polite">No chapter or slide title available at this time.</p>
                 <div class="row-actions compatible-audio-row">
+                    <span id="audioOptionsLabel">Audio</span>
                     <label id="compatibleAudioControls" hidden><input id="compatibleAudioVolume" type="range" min="0" max="1" step="0.05" value="1"> Audio volume</label>
                     <p id="compatibleAudioStatus" role="status" aria-live="polite" hidden></p>
                     <details class="contextual-help"><summary aria-label="Audio help and options" title="Audio help and options">?</summary><p>Audio is automatic: native playback is used when supported. If this browser cannot decode the audio, a synchronized WAV copy is prepared without changing the original. Use Audio volume when that copy is active. If automatic detection cannot identify an audio problem, choose Compatible audio below.</p><label>Audio mode <select id="compatibleAudioMode"><option value="auto" selected>Automatic (recommended)</option><option value="native">Native audio</option><option value="compatible">Compatible audio</option></select></label></details>
@@ -898,11 +899,11 @@
                                 <div id="adaptiveDetectionOptions">
                                     <label for="adaptiveDetail">Which slide changes should appear?</label>
                                     <select id="adaptiveDetail">
-                                        <option value="fewer">Slides only (skip bullet builds)</option>
-                                        <option value="balanced" selected>Slides and major builds (recommended)</option>
-                                        <option value="more">Slides and every build</option>
+                                        <option value="fewer">Slide changes only (ignore added bullets)</option>
+                                        <option value="balanced" selected>Slide changes and major variations (recommended)</option>
+                                        <option value="more">Slide changes and every addition</option>
                                     </select>
-                                    <details class="ui-disclosure"><summary>? Help</summary><p>All choices keep detected full slide replacements. The difference is whether newly added bullets and other incremental builds become separate slides. A slide must settle long enough to be sampled; brief flashes and continuous animation may not be detected.</p></details>
+                                    <details class="ui-disclosure" data-help-for="adaptiveDetail"><summary>? Help</summary><p>All choices keep detected full slide replacements. Variations include bullet points, text or diagrams appearing step by step on the same slide (sometimes called slide builds). Choose whether major variations or every addition should be saved as separate slide images. A slide must settle long enough to be sampled; brief flashes and continuous animation may not be detected.</p></details>
                                 </div>
                                 <details id="advancedSlideDetectionOptions" class="ui-disclosure">
                                 <summary>Advanced: method and limits</summary>
@@ -921,7 +922,7 @@
                                     <small>Lower values detect more hard cuts. Higher values detect fewer cuts.</small>
                                 </div>
                                 <div id="visualDetectionOptions">
-                                    <label for="minimumSlideDuration">Ignore quick builds</label>
+                                    <label for="minimumSlideDuration">Ignore quick additions</label>
                                     <select id="minimumSlideDuration">
                                         <option value="auto" selected>Only flashes under 2 seconds (recommended)</option>
                                         <option value="0.25">0.25% (9 s per hour of video)</option>
@@ -929,7 +930,7 @@
                                         <option value="1">1% (36 s per hour of video)</option>
                                         <option value="2">2% (72 s per hour of video)</option>
                                     </select>
-                                    <small>Custom percentages merge nearby builds. In adaptive mode, full slide replacements are preserved and earlier slide starts are not moved. Hard cuts use this as a minimum for all cuts.</small>
+                                    <small>Custom percentages combine additions appearing close together on the same slide. In adaptive mode, full slide replacements are preserved and earlier slide starts are not moved. Hard cuts use this as a minimum for all cuts.</small>
                                     <label for="maximumSlidesPerHour">Maximum slides per hour</label>
                                     <select id="maximumSlidesPerHour">
                                         <option value="auto" selected>Keep all detected slides (recommended)</option>
@@ -945,7 +946,7 @@
                                     <input id="includeChapterBoundaries" type="checkbox" checked>
                                     Include chapter boundaries
                                 </label>
-                                <details class="ui-disclosure"><summary>? Method help</summary><p id="sceneDetectionHelp">Adaptive mode ignores cursor and webcam movement and merges slide builds by detail level.</p></details>
+                                <details class="ui-disclosure" data-help-for="sceneDetectionMode"><summary>? Method help</summary><p id="sceneDetectionHelp">Adaptive mode ignores cursor and webcam movement and combines step-by-step additions according to the detail level.</p></details>
                                 </details>
                                     <label for="slideImageQuality">Image quality</label>
                                     <select id="slideImageQuality">
@@ -970,7 +971,7 @@
                                 <select id="slideHistorySelect"></select>
                                 <p id="slideHistoryStatus" role="status"></p>
                                 <div id="slideHistoryImages" class="slide-history-images"></div>
-                                <details class="ui-disclosure"><summary>? History help</summary>
+                                <details class="ui-disclosure" data-help-for="slideHistorySelect"><summary>? History help</summary>
                                     <p>View saved slides while new detection runs. Clicking a timestamp seeks the current video without replacing the active slide analysis. Sets are preserved from now on; previously overwritten slides cannot be recovered.</p>
                                 </details>
                             </dialog>

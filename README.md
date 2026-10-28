@@ -934,6 +934,9 @@ currently selected video source and captions are preserved.
 While the custom clip panel is open, drag the **IN** and **OUT** markers on
 the timeline below the video. The highlighted range and timestamp fields stay
 synchronized. Pin buttons beside the fields use the current playback position.
+**Video start** sets the start to 00:00:00; **Video end** sets the end to the
+full video duration, including milliseconds. These shortcuts update the markers
+without moving playback.
 The temporary **Start here** button beside the timeline captures the current
 playback position and becomes **End here**. Click again at the desired ending;
 playback is not paused or moved. An end at or before the start shows an error

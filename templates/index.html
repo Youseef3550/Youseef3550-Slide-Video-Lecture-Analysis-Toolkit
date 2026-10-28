@@ -1180,11 +1180,13 @@
             <div class="custom-clip-time-field">
                 <input id="customClipStart" type="text" placeholder="00:00:00" required>
                 <button id="customClipSetStartBtn" class="btn btn-secondary btn-icon" type="button" aria-label="Set clip start to current video time" title="Set start at current video time"><i class="fas fa-map-pin" aria-hidden="true"></i></button>
+                <button id="customClipVideoStartBtn" class="btn btn-secondary" type="button" title="Set clip start to 00:00:00">Video start</button>
             </div>
             <label for="customClipEnd">End timestamp</label>
             <div class="custom-clip-time-field">
                 <input id="customClipEnd" type="text" placeholder="00:01:00" required>
                 <button id="customClipSetEndBtn" class="btn btn-secondary btn-icon" type="button" aria-label="Set clip end to current video time" title="Set end at current video time"><i class="fas fa-map-pin" aria-hidden="true"></i></button>
+                <button id="customClipVideoEndBtn" class="btn btn-secondary" type="button" title="Set clip end to the full video duration">Video end</button>
             </div>
             <small>Marker keys: arrows = 1 second, Shift = 10 seconds, Alt = 0.1 seconds.</small>
             <p id="customClipStatus" role="status" aria-live="polite"></p>

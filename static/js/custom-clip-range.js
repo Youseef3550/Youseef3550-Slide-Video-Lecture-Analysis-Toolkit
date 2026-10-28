@@ -147,6 +147,14 @@ export function initCustomClipRange(player) {
         });
         document.getElementById(kind === 'start' ? 'customClipSetStartBtn' : 'customClipSetEndBtn')
             .addEventListener('click', () => move(kind, player.currentTime));
+        document.getElementById(kind === 'start' ? 'customClipVideoStartBtn' : 'customClipVideoEndBtn')
+            ?.addEventListener('click', () => {
+                if (!active) return;
+                (kind === 'start' ? startInput : endInput).value = clipTimestamp(kind === 'start' ? 0 : duration);
+                resetCapture();
+                status.textContent = valid(...values()) ? '' : 'Enter a valid start before the end, within the video duration.';
+                sync();
+            });
     }
     return {
         open() {

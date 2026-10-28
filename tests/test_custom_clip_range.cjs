@@ -17,7 +17,8 @@ function element() {
 }
 const ids = Object.fromEntries(['videoProgress', 'customClipRange', 'customClipRangeSelection',
     'customClipStatus', 'customClipStart', 'customClipEnd', 'customClipStartMarker',
-    'customClipEndMarker', 'customClipSetStartBtn', 'customClipSetEndBtn', 'customClipMarkBtn'].map(id => [id, element()]));
+    'customClipEndMarker', 'customClipSetStartBtn', 'customClipSetEndBtn', 'customClipMarkBtn',
+    'customClipVideoStartBtn', 'customClipVideoEndBtn'].map(id => [id, element()]));
 const context = vm.createContext({document: {getElementById: id => ids[id]}});
 vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 'custom-clip-range.js'), 'utf8')
     .replace(/^export /gm, ''), context);
@@ -124,5 +125,23 @@ player.currentTime = player.duration;
 ids.customClipMarkBtn.listeners.click();
 assert.equal(ids.customClipEnd.value, '00:01:00.125', 'Capturing video end stays inside millisecond duration');
 assert(controls.validate());
+const playbackBeforeBounds = player.currentTime;
+ids.customClipStart.value = 'bad';
+ids.customClipVideoStartBtn.listeners.click();
+assert.equal(ids.customClipStart.value, '00:00:00');
+ids.customClipEnd.value = 'bad';
+ids.customClipVideoEndBtn.listeners.click();
+assert.equal(ids.customClipEnd.value, '00:01:00.125');
+assert.equal(end.attributes['aria-valuenow'], '60.125');
+assert.equal(start.attributes['aria-valuenow'], '0');
+assert.equal(ids.customClipRangeSelection.style.width, '100%');
+assert.equal(player.currentTime, playbackBeforeBounds, 'Video boundary shortcuts do not move playback');
+assert(controls.validate());
 controls.close();
+ids.customClipStart.value = '00:00:10';
+ids.customClipVideoStartBtn.listeners.click();
+assert.equal(ids.customClipStart.value, '00:00:10', 'Closed clip controls cannot change the range');
+const template = fs.readFileSync(path.join(__dirname, '..', 'templates', 'index.html'), 'utf8');
+assert.match(template, /id="customClipVideoStartBtn"[^>]*>Video start</);
+assert.match(template, /id="customClipVideoEndBtn"[^>]*>Video end</);
 console.log('PASS: precise clip markers, sequential playback capture, drag clamping, keyboard, pins and cleanup');

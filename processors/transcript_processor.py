@@ -229,7 +229,7 @@ class TranscriptProcessor:
 
     async def generate_whisper_transcript(
         self, video_id: str, background_tasks, diarization=False, force=False,
-        model="turbo", prompt=None, speakers_only=False, speaker_mode="standard",
+        model="turbo", prompt=None, speakers_only=False, speaker_mode="fast",
     ):
         """Generate a transcript using local Whisper or an online model.
 
@@ -242,14 +242,31 @@ class TranscriptProcessor:
             })
         if speakers_only:
             progress = TRANSCRIPTS_DIR / f"{video_id}_whisper_progress.txt"
-            if progress.is_file() and time.time() - progress.stat().st_mtime <= self.progress_stale_seconds:
+            stale_seconds = (
+                max(self.progress_stale_seconds, 3600)
+                if self._read_whisper_phase(video_id) == "identifying_speakers"
+                else self.progress_stale_seconds
+            )
+            if progress.is_file() and time.time() - progress.stat().st_mtime <= stale_seconds:
                 return JSONResponse({
                     "success": True, "status": "in_progress",
                     "phase": "identifying_speakers",
                     "message": "Transcript processing is already running. Showing its progress.",
                     "status_url": f"/whisper_transcript_status/{video_id}",
                 })
-            if not (TRANSCRIPTS_DIR / f"{video_id}_whisper.json").is_file():
+            transcript_path = TRANSCRIPTS_DIR / f"{video_id}_whisper.json"
+            if not transcript_path.is_file() and not progress.exists():
+                for snapshot in (self._speaker_backup_path(video_id), self._pending_transcript_path(video_id)):
+                    if snapshot.is_file():
+                        try:
+                            transcript = json.loads(snapshot.read_text(encoding="utf-8"))
+                        except (OSError, json.JSONDecodeError) as error:
+                            return JSONResponse({"success": False, "error": f"Could not read the saved transcript snapshot: {error}"})
+                        if not isinstance(transcript, list) or not transcript:
+                            return JSONResponse({"success": False, "error": "The saved transcript snapshot is invalid."})
+                        shutil.copyfile(snapshot, transcript_path)
+                        break
+            if not transcript_path.is_file():
                 return JSONResponse({
                     "success": False,
                     "error": "Generate a transcript first; speakers are identified in an existing transcript.",

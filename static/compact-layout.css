@@ -1316,17 +1316,18 @@ progress {
 .project-search-bar {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 6px;
 }
 
 .project-search-bar > input {
-    flex: 1 1 180px;
+    flex: 1 1 0;
     min-width: 0;
 }
 
 .project-search-button {
     display: inline-flex;
+    flex: 0 0 auto;
     align-items: stretch;
     border: 1px solid var(--border-color, #888);
     border-radius: 6px;

@@ -80,6 +80,33 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
             terminate.assert_not_called()
             self.assertTrue((root / "vid_whisper_before_speakers.json").exists())
 
+    def test_speaker_reconnect_uses_same_stale_threshold_as_status(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)):
+            root = Path(directory)
+            progress = root / "vid_whisper_progress.txt"
+            progress.write_text("100")
+            os.utime(progress, (time.time() - 1200, time.time() - 1200))
+            (root / "vid_whisper_phase.txt").write_text("identifying_speakers")
+            response = asyncio.run(TranscriptProcessor().generate_whisper_transcript(
+                "vid", mock.Mock(), speakers_only=True))
+            self.assertEqual(response.content["status"], "in_progress")
+
+    def test_speaker_retry_restores_snapshot_after_worker_stopped(self):
+        for suffix in ("before_speakers", "pending"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)), \
+                    mock.patch.object(transcript_module, "VIDEO_DIR", Path(directory)):
+                root = Path(directory)
+                (root / "video.mp4").write_bytes(b"video")
+                (root / f"video_whisper_{suffix}.json").write_text('[{"start":0,"text":"Existing"}]')
+                tasks = mock.Mock()
+                response = asyncio.run(TranscriptProcessor().generate_whisper_transcript(
+                    "video", tasks, speakers_only=True))
+                self.assertTrue(response.content["success"])
+                self.assertEqual(tasks.add_task.call_args.args[5][0]["text"], "Existing")
+                self.assertEqual(tasks.add_task.call_args.args[-1], "fast")
+
     def test_cancel_restores_previous_transcript_and_clears_progress(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)), \
@@ -640,7 +667,7 @@ class PyannoteCompatibilityTests(unittest.TestCase):
                 processor._run_pyannote(object(), "hf", "video.mp4", speaker_mode="quick")
             load.assert_not_called()
 
-    def test_generate_route_passes_speaker_mode_and_defaults_to_standard(self):
+    def test_generate_route_passes_speaker_mode_and_defaults_to_fast(self):
         source = Path(__file__).resolve().parents[1] / "main.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         route = next(node for node in tree.body
@@ -653,7 +680,7 @@ class PyannoteCompatibilityTests(unittest.TestCase):
             "json": json, "transcript_processor": processor,
         }
         exec(compile(ast.Module(body=[route], type_ignores=[]), str(source), "exec"), namespace)
-        for options, expected in (({"speakers_only": True, "speaker_mode": "fast"}, "fast"), ({}, "standard")):
+        for options, expected in (({"speakers_only": True, "speaker_mode": "standard"}, "standard"), ({}, "fast")):
             request = mock.Mock(json=mock.AsyncMock(return_value=options))
             result = asyncio.run(namespace["generate_whisper_transcript"]("video", request, object()))
             self.assertEqual(result, "response")

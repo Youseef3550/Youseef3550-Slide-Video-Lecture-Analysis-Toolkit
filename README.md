@@ -754,7 +754,7 @@ improve CPU throughput; GPU runs retain the model's configured batch size.
 The batch size is shown in the step log. This still analyzes the complete audio
 with the same model and detection settings. Long recordings can remain slow on
 CPU-only machines; this change applies to newly started workers, not active jobs.
-Choose **Speakers: Fast** beside **Label speakers** for fewer overlapping
+**Speakers: Fast** is the default beside **Label speakers**, using fewer overlapping
 analysis windows (50% overlap instead of the standard model's 90%). This keeps
 full audio coverage and the original transcript text/timestamps, but short
 speaker changes may be less precise. The same choice applies when regenerating

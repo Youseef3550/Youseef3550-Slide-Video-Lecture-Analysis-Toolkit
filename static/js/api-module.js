@@ -157,7 +157,7 @@ export async function regenerateTranscript(options = {}) {
     const originalTranscript = state.currentTranscript.map((item) => ({ ...item }));
 
     const diarization = speakersOnly || elements.transcriptDiarization?.checked || false;
-    const speakerMode = document.getElementById('speakerMode')?.value || 'standard';
+    const speakerMode = document.getElementById('speakerMode')?.value || 'fast';
     const model = elements.transcriptModel?.value || '';
     if (model) sessionStorage.setItem('transcriptModelSessionV1', model);
     const prompt = elements.transcriptPrompt?.value.trim() || '';
@@ -194,10 +194,17 @@ export async function regenerateTranscript(options = {}) {
             })
         });
         const data = await readJsonResponse(response, 'Transcript regeneration');
-        if (!data.success) throw new Error(data.error || 'Transcript regeneration failed');
+        let reconnected = false;
+        if (!data.success) {
+            const statusResponse = await fetch(`/whisper_transcript_status/${encodeURIComponent(videoId)}`);
+            const status = await readJsonResponse(statusResponse, 'Checking transcript processing');
+            if (status.status !== 'in_progress') throw new Error(data.error || 'Transcript regeneration failed');
+            reconnected = true;
+        }
         elements.transcriptOptionsDialog?.close();
         showNotification(
-            data.phase === 'identifying_speakers'
+            reconnected ? 'Processing is already running. Reconnected to its progress.'
+                : data.phase === 'identifying_speakers'
                 ? 'Using the existing transcript. Speaker identification started.'
                 : data.status === 'in_progress'
                 ? 'Transcript generation is already running. Showing its progress.'

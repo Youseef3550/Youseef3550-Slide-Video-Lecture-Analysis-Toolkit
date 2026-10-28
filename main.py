@@ -839,7 +839,7 @@ async def generate_whisper_transcript(video_id: str, request: Request, backgroun
         str(options.get("model") or "") or None,
         str(options.get("prompt") or "").strip() or None,
         speakers_only=bool(options.get("speakers_only", False)),
-        speaker_mode=options.get("speaker_mode", "standard"),
+        speaker_mode=options.get("speaker_mode", "fast"),
     )
 
 @app.get("/whisper_transcript_status/{video_id}")

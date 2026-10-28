@@ -60,8 +60,8 @@ vm.runInContext(source, context);
     assert.match(template, /id="chapterBasis"/);
     for (const mode of ['topics', 'speakers', 'topics_speakers']) assert(template.includes(`value="${mode}"`));
     assert.match(toolbar, /id="speakerMode"/);
-    assert.match(toolbar, /value="standard" selected/);
-    assert.match(toolbar, /value="fast"/);
+    assert.match(toolbar, /value="standard"/);
+    assert.match(toolbar, /value="fast" selected/);
     assert.match(toolbar, /Short speaker changes may be less precise/);
     const jsonResponse = data => ({ok: true, status: 200, text: async () => JSON.stringify(data)});
     const speakerButton = {textContent: 'Label speakers', removeAttribute() {}};
@@ -70,6 +70,7 @@ vm.runInContext(source, context);
     const staleCalls = [];
     context.fetch = async (url, options) => {
         staleCalls.push({url, options});
+        if (url === '/runtime_status') return jsonResponse({speaker_modes: ['standard', 'fast']});
         return jsonResponse(url.startsWith('/generate_whisper_transcript/')
             ? {success: true} : {status: 'complete', transcript: [{text: 'Finished', start: 0}]});
     };
@@ -253,5 +254,20 @@ vm.runInContext(source, context);
     context.renderWhisperProgress({...running(60), available_transcript: [{text: 'Other snapshot'}]}, Date.now());
     assert.equal(context.state.currentTranscript[0].text, 'Available before speakers finish',
         'Further speaker polls must not replace the transcript being used for chapters');
+    context.finishTranscriptAction(context.state.currentVideoId);
+    let reconnectChecks = 0;
+    context.fetch = async (url, options) => {
+        if (url === '/runtime_status') return jsonResponse({speaker_modes: ['standard', 'fast']});
+        if (options?.method === 'POST') return jsonResponse({success: false, error: 'Generate a transcript first'});
+        reconnectChecks++;
+        return jsonResponse(reconnectChecks === 1 ? running(70)
+            : {status: 'complete', transcript: [{text: 'Labeled', start: 0}]});
+    };
+    const errorsBeforeReconnect = errors.length;
+    await context.regenerateTranscript({speakersOnly: true});
+    assert.equal(reconnectChecks, 2, 'An already running job is reconnected and polled after a rejected retry');
+    assert.equal(errors.length, errorsBeforeReconnect, 'A temporary missing-transcript response must not hide an active job');
+    const compactCss = fs.readFileSync(path.join(__dirname, '..', 'static', 'compact-layout.css'), 'utf8');
+    assert.match(compactCss, /\.project-search-bar\s*\{[^}]*flex-wrap:\s*nowrap/);
     console.log('PASS: reconnect to transcription progress without restarting the job');
 })().catch(error => {console.error(error); process.exitCode = 1;});

@@ -37,6 +37,7 @@ import { initLibrarySearch } from './library-search.js';
 import { initCompatibleAudio } from './compatible-audio.js';
 import { initSecondJumps, initPlaybackSpeed } from './video.js';
 import { initFrameScreenshot } from './slide-downloads.js';
+import { initTranscriptReady } from './transcript-ready.js';
 
 // Global state
 export const state = {
@@ -558,6 +559,7 @@ function initApp() {
         notify: showNotification,
     });
     initLibrary();
+    initTranscriptReady({ state, chapters: generateChapters, slides: detectScenes, notify: showNotification });
     initFrameScreenshot();
     initSpeakerTimeline();
     initVideoSummary();

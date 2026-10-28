@@ -252,6 +252,16 @@
             <p>Loading video and processing data...</p>
         </div>
 
+        <section id="transcriptReadyPrompt" class="transcript-ready-prompt" aria-labelledby="transcriptReadyHeading" hidden>
+            <strong id="transcriptReadyHeading">Transcript ready. What would you like to start?</strong>
+            <div class="row-actions">
+                <button class="btn btn-primary" type="button" data-ready-action="chapters">Chapters</button>
+                <button class="btn btn-secondary" type="button" data-ready-action="slides">Slides</button>
+                <button class="btn btn-primary" type="button" data-ready-action="both">Both</button>
+                <button class="btn btn-secondary" type="button" data-ready-action="none">Not now</button>
+                <label><input id="rememberTranscriptReady" type="checkbox"> Remember my choice</label>
+            </div>
+        </section>
         <div class="main-content">
             <!-- Left column: Video player and timeline -->
             <div class="video-container">
@@ -1046,6 +1056,16 @@
             <span id="closeSettingsBtn" class="modal-close">&times;</span>
             <h2><i class="fas fa-cog"></i> Settings</h2>
             
+            <div class="settings-section">
+                <label for="transcriptReadyAction">When a new transcript is ready</label>
+                <select id="transcriptReadyAction">
+                    <option value="ask">Ask me (recommended)</option>
+                    <option value="chapters">Start chapters</option>
+                    <option value="slides">Start slide detection</option>
+                    <option value="both">Start chapters and slide detection</option>
+                    <option value="none">Keep both manual</option>
+                </select>
+            </div>
             <div class="settings-section">
                 <h3>Compute device</h3>
                 <p id="runtimeStatus" class="settings-description">Checking GPU availability...</p>

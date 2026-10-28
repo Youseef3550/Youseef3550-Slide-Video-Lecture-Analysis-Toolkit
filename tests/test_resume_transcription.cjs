@@ -8,6 +8,7 @@ const requests = [];
 const loaded = [];
 const errors = [];
 const timers = [];
+const events = [];
 const context = vm.createContext({
     startProcessButton: require('./process_button_stub.cjs'),
     finishProcessButton: require('./process_button_stub.cjs').finish,
@@ -16,9 +17,10 @@ const context = vm.createContext({
         return () => {};
     },
     console, Date, setTimeout, clearTimeout,
+    CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
     state: {currentVideoId: 'video', currentTranscript: [], whisperTranscriptPollGeneration: 0},
     elements: {transcriptContainer: {}, regenerateTranscriptBtn: {textContent: 'Regenerate', removeAttribute() {}}},
-    document: {getElementById: () => null, addEventListener: () => {}},
+    document: {getElementById: () => null, addEventListener: () => {}, dispatchEvent(event) { events.push(event); }},
     showError: (message) => { if (message) errors.push(message); },
     showNotification: () => {},
     loadTranscript: (transcript) => loaded.push(transcript),
@@ -34,6 +36,7 @@ vm.runInContext(source, context);
     await context.regenerateTranscript({resumeOnly: true});
     assert.deepEqual(requests, ['/whisper_transcript_status/video']);
     assert.equal(loaded.length, 1);
+    assert.equal(events.filter(event => event.type === 'newTranscriptReady').length, 1);
     assert.deepEqual(errors, []);
     context.renderWhisperProgress({status: 'running', steps_elapsed: 125}, Date.now());
     assert.equal(timers.at(-1), 125, 'Reconnect uses server elapsed, not a fresh browser clock');
@@ -98,6 +101,8 @@ vm.runInContext(source, context);
         assert.equal(payload.diarization, true);
         assert.equal(calls.some(call => call.url === '/runtime_status'), mode === 'fast');
     }
+    assert.equal(events.filter(event => event.type === 'newTranscriptReady').length, 1,
+        'Labeling existing speakers does not trigger a new-transcript prompt');
     const unsupportedRequests = [];
     context.state.currentTranscript = [{text: 'Keep the existing transcript', start: 0}];
     context.fetch = async (url, options) => {

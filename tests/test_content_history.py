@@ -1,4 +1,7 @@
 import tempfile
+import subprocess
+import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -140,6 +143,92 @@ class ContentHistoryTests(unittest.TestCase):
         self.assertEqual(content["transcript_language"], "")
         self.assertEqual(content["source"], "whisper")
         self.assertEqual(content["chapter_language"], "")
+
+    def test_existing_transcript_chapters_can_run_during_speaker_processing(self):
+        from processors.summary_processor import SummaryProcessor
+        app = FastAPI()
+        app.add_middleware(history.ContentHistoryMiddleware)
+
+        @app.post("/generate_summary")
+        async def generate():
+            SummaryProcessor._save_chapters("video", [{"timestamp": "00:00", "title": "Topic"}])
+            return {"success": True}
+
+        progress = history.TRANSCRIPTS_DIR / "video_whisper_progress.txt"
+        progress.write_text("0")
+        with mock.patch("processors.summary_processor.SUMMARIES_DIR", history.SUMMARIES_DIR), TestClient(app) as client:
+            body = {"video_id": "video", "transcript": [{"start": 0, "text": "Existing text"}]}
+            self.assertEqual(client.post("/generate_summary", json=body).status_code, 200)
+            self.assertEqual(history.status("video")["undo"], "Generate chapters")
+            for basis in ("speakers", "topics_speakers"):
+                self.assertEqual(client.post("/generate_summary", json={**body, "basis": basis}).status_code, 409)
+            self.assertEqual(client.post("/generate_summary", json={**body, "transcript": []}).status_code, 409)
+            history._busy.add("video")
+            self.assertEqual(client.post("/generate_summary", json=body).status_code, 409)
+            history._busy.clear()
+        progress.unlink()
+        history.restore("video", "undo")
+        self.assertFalse((history.SUMMARIES_DIR / "video.json").exists())
+        self.assertIn(b"Before", self.transcript.read_bytes())
+
+    def test_background_transcript_save_and_chapters_have_separate_undo_entries(self):
+        from processors.summary_processor import SummaryProcessor
+        app = FastAPI()
+        app.add_middleware(history.ContentHistoryMiddleware)
+        labeled = b'[{"start":0,"text":"Before","speaker":"Speaker 1"}]'
+
+        @app.post("/generate_summary")
+        async def generate():
+            # Speaker labeling finishes while the AI is still generating chapters.
+            with history.save_lock():
+                before = history.capture("video")
+                self.transcript.write_bytes(labeled)
+                history.record("video", "Label speakers", before)
+            SummaryProcessor._save_chapters("video", [{"timestamp": "00:00", "title": "Topic"}])
+            return {"success": True}
+
+        with mock.patch("processors.summary_processor.SUMMARIES_DIR", history.SUMMARIES_DIR), TestClient(app) as client:
+            response = client.post("/generate_summary", json={
+                "video_id": "video", "transcript": [{"start": 0, "text": "Before"}],
+            })
+            self.assertEqual(response.status_code, 200)
+        history.restore("video", "undo")
+        self.assertEqual(self.transcript.read_bytes(), labeled, "Undo chapters must not undo finished speaker labeling")
+        history.restore("video", "undo")
+        self.assertIn(b'"text":"Before"', self.transcript.read_bytes())
+        self.assertNotIn(b"speaker", self.transcript.read_bytes())
+        history.restore("video", "redo")
+        history.restore("video", "redo")
+        self.assertEqual(self.transcript.read_bytes(), labeled)
+        self.assertTrue((history.SUMMARIES_DIR / "video.json").exists())
+
+    def test_save_lock_serializes_separate_worker_processes(self):
+        started = history.HISTORY_DB.parent / "worker-started"
+        finished = history.HISTORY_DB.parent / "worker-finished"
+        code = (
+            "import sys; from pathlib import Path; import content_history as h; "
+            "h.HISTORY_DB=Path(sys.argv[1]); Path(sys.argv[2]).touch()\n"
+            "with h.save_lock(): Path(sys.argv[3]).touch()\n"
+        )
+        with history.save_lock():
+            process = subprocess.Popen(
+                [sys.executable, "-c", code, str(history.HISTORY_DB), str(started), str(finished)],
+                cwd=Path(history.__file__).parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 20
+                while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(started.exists(), "Worker must reach the save lock")
+                time.sleep(0.2)
+                self.assertFalse(finished.exists(), "Worker cannot save while chapter save holds the lock")
+            except BaseException:
+                process.kill()
+                process.communicate()
+                raise
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
+        self.assertTrue(finished.exists())
 
 
 if __name__ == "__main__":

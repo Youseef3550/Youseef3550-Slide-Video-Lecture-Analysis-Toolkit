@@ -614,52 +614,53 @@ class TranscriptProcessor:
                     step(f"Speaker identification failed; keeping the transcript: {error}")
             step(f"Saving the transcript (total {time.monotonic() - started:.0f}s)")
             import content_history
-            history_before = content_history.capture(video_id)
-            backup = self._speaker_backup_path(video_id)
-            if backup.is_file():
-                history_before[str(Path(output_path).resolve())] = backup.read_bytes()
-            with open(output_path, 'w') as f:
-                json.dump(transcript, f)
-            previous_metadata = self._read_whisper_metadata(video_id)
-            if original_transcript:
-                device = previous_metadata.get("device")
-                method = previous_metadata.get("transcription_method")
-                generated_at = previous_metadata.get("generated_at")
-            elif is_cloud_model(model):
-                device = "cloud"
-                method = describe_cloud_method(model)
-                generated_at = time.strftime("%Y-%m-%d %H:%M")
-            else:
-                device, _ = get_whisper_device_config()
-                method = describe_transcription_method(device)
-                generated_at = time.strftime("%Y-%m-%d %H:%M")
-            with open(str(TRANSCRIPTS_DIR / f"{video_id}_whisper_meta.json"), "w") as f:
-                json.dump({
-                    "model": model,
-                    "prompt": prompt or "",
-                    "device": device,
-                    "transcription_method": method,
-                    "word_timestamps": not is_cloud_model(model),
-                    "diarization": bool(diarization) and not diarization_error,
-                    "diarization_error": diarization_error,
-                    "speaker_mode": speaker_mode if diarization else None,
-                    "speaker_names": speaker_names,
-                    "generated_at": generated_at,
-                }, f)
-            if speaker_names:
+            with content_history.save_lock():
+                history_before = content_history.capture(video_id)
+                backup = self._speaker_backup_path(video_id)
+                if backup.is_file():
+                    history_before[str(Path(output_path).resolve())] = backup.read_bytes()
+                with open(output_path, 'w') as f:
+                    json.dump(transcript, f)
+                previous_metadata = self._read_whisper_metadata(video_id)
+                if original_transcript:
+                    device = previous_metadata.get("device")
+                    method = previous_metadata.get("transcription_method")
+                    generated_at = previous_metadata.get("generated_at")
+                elif is_cloud_model(model):
+                    device = "cloud"
+                    method = describe_cloud_method(model)
+                    generated_at = time.strftime("%Y-%m-%d %H:%M")
+                else:
+                    device, _ = get_whisper_device_config()
+                    method = describe_transcription_method(device)
+                    generated_at = time.strftime("%Y-%m-%d %H:%M")
+                with open(str(TRANSCRIPTS_DIR / f"{video_id}_whisper_meta.json"), "w") as f:
+                    json.dump({
+                        "model": model,
+                        "prompt": prompt or "",
+                        "device": device,
+                        "transcription_method": method,
+                        "word_timestamps": not is_cloud_model(model),
+                        "diarization": bool(diarization) and not diarization_error,
+                        "diarization_error": diarization_error,
+                        "speaker_mode": speaker_mode if diarization else None,
+                        "speaker_names": speaker_names,
+                        "generated_at": generated_at,
+                    }, f)
+                if speaker_names:
+                    try:
+                        updated = transcript_versions.copy_speakers_to_translations(video_id, transcript, speaker_names)
+                        if updated:
+                            step(f"Speakers added to {updated} translated transcript(s)")
+                    except Exception as error:
+                        print(f"Could not add speakers to translations: {error}")
                 try:
-                    updated = transcript_versions.copy_speakers_to_translations(video_id, transcript, speaker_names)
-                    if updated:
-                        step(f"Speakers added to {updated} translated transcript(s)")
+                    transcript_versions.sync_existing(video_id)
                 except Exception as error:
-                    print(f"Could not add speakers to translations: {error}")
-            try:
-                transcript_versions.sync_existing(video_id)
-            except Exception as error:
-                print(f"Could not store the transcript version: {error}")
+                    print(f"Could not store the transcript version: {error}")
+                content_history.record(video_id, "Label speakers" if original_transcript else "Generate transcript", history_before)
 
             progress_file = str(TRANSCRIPTS_DIR / f"{video_id}_whisper_progress.txt")
-            content_history.record(video_id, "Label speakers" if original_transcript else "Generate transcript", history_before)
             heartbeat_stop.set()
             heartbeat.join(timeout=self.heartbeat_seconds + 1)
             if os.path.exists(progress_file):

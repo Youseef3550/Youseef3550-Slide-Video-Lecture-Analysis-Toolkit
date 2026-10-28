@@ -2262,6 +2262,18 @@ class SummaryProcessor:
     def _save_chapters(video_id: str, chapters: list, transcript_language: str = "", transcript=None):
         if not video_id:
             return
+        import content_history
+        with content_history.save_lock():
+            before = content_history.capture(video_id)
+            try:
+                SummaryProcessor._write_chapters(video_id, chapters, transcript_language, transcript)
+            finally:
+                content_history.record(video_id, "Generate chapters", before)
+
+    @staticmethod
+    def _write_chapters(video_id: str, chapters: list, transcript_language: str = "", transcript=None):
+        if not video_id:
+            return
         if transcript_language:
             # Chapters of a translated transcript belong to that translation.
             summary_path = SUMMARIES_DIR / f"{video_id}_summary_{transcript_language}.json"

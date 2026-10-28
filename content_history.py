@@ -38,6 +38,19 @@ def validate(video_id):
     if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
         raise ValueError("Invalid video ID.")
 
+@contextmanager
+def save_lock():
+    """Serialize short save transactions across the app and transcription workers."""
+    with _lock:
+        HISTORY_DB.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(HISTORY_DB.with_name("save-lock.sqlite3"), timeout=30)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield
+        finally:
+            connection.rollback()
+            connection.close()
+
 
 @contextmanager
 def _connection():
@@ -231,13 +244,22 @@ class ContentHistoryMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         parts = request.url.path.strip("/").split("/")
         video_id, label = None, None
+        chapters = False
+        existing_transcript = False
         if len(parts) == 2 and parts[0] in _ACTIONS:
             video_id, label = parts[1], _ACTIONS[parts[0]]
         elif parts == ["generate_summary"]:
             try:
                 data = await request.json()
-                video_id = data.get("video_id") if isinstance(data, dict) else None
+                if not isinstance(data, dict):
+                    return await call_next(request)
+                video_id = data.get("video_id")
                 label = "Generate chapters"
+                chapters = True
+                existing_transcript = (
+                    isinstance(data.get("transcript"), list) and bool(data["transcript"])
+                    and data.get("basis", "topics") in ("topics", "timestamps")
+                )
             except ValueError:
                 return await call_next(request)
         elif len(parts) == 3 and parts[0] == "video_summary" and parts[2] == "generate":
@@ -247,10 +269,10 @@ class ContentHistoryMiddleware(BaseHTTPMiddleware):
         try:
             validate(video_id)
             with _lock:
-                if _running(video_id):
+                if video_id in _busy or (_running(video_id) and not (chapters and existing_transcript)):
                     return JSONResponse({"detail": "Another content operation is running. Finish or stop it first."}, status_code=409)
                 _busy.add(video_id)
-            before = await asyncio.to_thread(capture, video_id)
+            before = {} if chapters else await asyncio.to_thread(capture, video_id)
         except (OSError, ValueError, sqlite3.Error) as error:
             with _lock:
                 _busy.discard(video_id)
@@ -259,7 +281,8 @@ class ContentHistoryMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
             # Preserve partial saves too, even if a multi-file operation reports an error.
-            await asyncio.to_thread(record, video_id, label, before)
+            if not chapters:
+                await asyncio.to_thread(record, video_id, label, before)
             return response
         except (OSError, ValueError, sqlite3.Error) as error:
             logger.exception("Could not save Undo history for %s", video_id)

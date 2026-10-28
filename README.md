@@ -982,6 +982,18 @@ timestamps. If evidence still fails validation, existing saved chapters are kept
 Completed or failed background transcription clears its running controls.
 Label speakers checks server status before blocking on a previous job, so a
 stale browser processing flag cannot prevent labeling a completed transcript.
+Topic-based and timestamp-based chapter generation can use the currently open
+transcript while speaker labeling or transcription runs in the background.
+Speaker-based chapters still wait for processing to finish. Saves are serialized
+and recorded separately so Undo does not combine chapters with background transcript changes.
+When a newly generated or uploaded transcript becomes ready, a compact prompt
+offers **Chapters**, **Slides**, **Both**, or **Not now**. Nothing starts by
+default; **Both** starts the independent jobs together using their current options.
+**Remember my choice** applies to future new transcripts in this browser.
+Change or reset it under **Settings > When a new transcript is ready**.
+Reopening saved projects, changing transcript versions or labeling speakers does
+not trigger the prompt. Remembered automatic choices do not replace existing
+chapters or detected slides.
 Row editing keeps the optional Review reason field collapsed by default;
 existing saved review notes remain available and are preserved when saving.
 Start and End fields include pin buttons (**Start here** / **End here**) to

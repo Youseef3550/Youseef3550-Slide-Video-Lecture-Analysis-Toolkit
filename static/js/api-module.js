@@ -36,6 +36,10 @@ function applyActiveTranscriptSource(data, videoId) {
 
 let activeTranscriptAction = null;
 
+function transcriptReady(videoId) {
+    document.dispatchEvent(new CustomEvent('newTranscriptReady', { detail: { videoId } }));
+}
+
 function finishTranscriptAction(videoId) {
     if (activeTranscriptAction?.videoId !== videoId) return;
     finishProcessButton(activeTranscriptAction.button);
@@ -132,6 +136,7 @@ export async function regenerateTranscript(options = {}) {
                 state.currentTranscriptSource = 'whisper';
                 loadTranscript(applySpeakerNames(status.transcript, status.speaker_names || {}));
                 renderSpeakerNames(status.speaker_names || {});
+                if (!speakersOnly) transcriptReady(videoId);
                 showNotification(`Transcript generated with ${describeTranscriptionModel(status.model || model)}.`, 'success');
                 if (status.metadata?.diarization_error) {
                     showError(
@@ -434,6 +439,7 @@ export async function uploadTranscriptFile() {
         state.currentTranscriptSource = 'uploaded';
         updateTranslationOptions(data.source_language);
         showNotification(`Uploaded transcript loaded (${data.source_language}).`, 'success');
+        transcriptReady(state.currentVideoId);
 }
 
 export async function translateTranscript() {
@@ -743,6 +749,7 @@ async function startYoutubeWhisperPolling(videoId) {
         elements.generateSummaryBtn.disabled = false;
         elements.exportChaptersBtn.disabled = false;
         showNotification('Whisper transcript generation complete. Generate chapters and Generate summary are ready.', 'success');
+        transcriptReady(videoId);
     };
 
     const pollStartedAt = Date.now();
@@ -1091,6 +1098,7 @@ export async function processVideo() {
 
             // Enable generate summary button if transcript is available
             elements.generateSummaryBtn.disabled = false;
+            transcriptReady(data.video_id);
             elements.exportChaptersBtn.disabled = false;
         } else if (data.transcript_in_progress) {
             try {

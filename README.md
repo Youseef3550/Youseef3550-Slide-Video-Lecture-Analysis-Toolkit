@@ -979,6 +979,9 @@ Chapter and section boundary verification checks transcript cue IDs and exact
 supporting quotes. An invalid verification response gets one targeted correction
 attempt for that batch, without regenerating the outline or accepting guessed
 timestamps. If evidence still fails validation, existing saved chapters are kept.
+Completed or failed background transcription clears its running controls.
+Label speakers checks server status before blocking on a previous job, so a
+stale browser processing flag cannot prevent labeling a completed transcript.
 Row editing keeps the optional Review reason field collapsed by default;
 existing saved review notes remain available and are preserved when saving.
 Start and End fields include pin buttons (**Start here** / **End here**) to

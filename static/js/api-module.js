@@ -36,10 +36,29 @@ function applyActiveTranscriptSource(data, videoId) {
 
 let activeTranscriptAction = null;
 
+function finishTranscriptAction(videoId) {
+    if (activeTranscriptAction?.videoId !== videoId) return;
+    finishProcessButton(activeTranscriptAction.button);
+    activeTranscriptAction = null;
+}
+
 export async function regenerateTranscript(options = {}) {
     const speakersOnly = options?.speakersOnly === true;
     const videoId = getActiveVideoId();
     const button = speakersOnly ? document.getElementById('identifySpeakersBtn') : elements.regenerateTranscriptBtn;
+    if (activeTranscriptAction && !options.resumeOnly) {
+        const action = activeTranscriptAction;
+        try {
+            const response = await fetch(`/whisper_transcript_status/${encodeURIComponent(action.videoId)}`);
+            const status = await readJsonResponse(response, 'Checking transcript processing');
+            if (['complete', 'error'].includes(status.status)) {
+                if (activeTranscriptAction === action) finishTranscriptAction(action.videoId);
+            }
+        } catch (error) {
+            showError(`Could not check transcript processing: ${error.message}`);
+            return;
+        }
+    }
     if (activeTranscriptAction && !options.resumeOnly) {
         if (activeTranscriptAction.videoId === videoId && activeTranscriptAction.button === button) {
             await activeTranscriptAction.stop();
@@ -735,6 +754,7 @@ async function startYoutubeWhisperPolling(videoId) {
             return false;
         }
         if (data.status === 'complete' && Array.isArray(data.transcript)) {
+            finishTranscriptAction(videoId);
             updateTranscript(data.transcript);
             if (state.youtubeTranscriptInterval) {
                 clearInterval(state.youtubeTranscriptInterval);
@@ -743,6 +763,7 @@ async function startYoutubeWhisperPolling(videoId) {
             return true;
         }
         if (data.status === 'error') {
+            finishTranscriptAction(videoId);
             if (state.youtubeTranscriptInterval) {
                 clearInterval(state.youtubeTranscriptInterval);
                 state.youtubeTranscriptInterval = null;
@@ -1215,6 +1236,7 @@ export async function processVideoUpload(file) {
                     const whisperData = await readJsonResponse(whisperResponse, 'Transcript status');
                     
                     if (whisperData.status === 'complete') {
+                        finishTranscriptAction(data.video_id);
                         if (whisperCheckInterval) clearInterval(whisperCheckInterval);
                         
                         // Transcript is ready, update UI
@@ -1230,6 +1252,7 @@ export async function processVideoUpload(file) {
                         // Enable generate summary button
                         elements.generateSummaryBtn.disabled = false;
                     } else if (whisperData.status === 'error') {
+                        finishTranscriptAction(data.video_id);
                         if (whisperCheckInterval) clearInterval(whisperCheckInterval);
                         elements.transcriptContainer.innerHTML = `
                             <div class="transcript-processing transcript-error">

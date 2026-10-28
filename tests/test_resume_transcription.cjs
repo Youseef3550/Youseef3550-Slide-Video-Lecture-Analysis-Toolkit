@@ -55,6 +55,31 @@ vm.runInContext(source, context);
     assert.match(toolbar, /value="fast"/);
     assert.match(toolbar, /Short speaker changes may be less precise/);
     const jsonResponse = data => ({ok: true, status: 200, text: async () => JSON.stringify(data)});
+    const speakerButton = {textContent: 'Label speakers', removeAttribute() {}};
+    context.document.getElementById = id => id === 'identifySpeakersBtn' ? speakerButton : null;
+    context.renderWhisperProgress({status: 'in_progress'}, Date.now());
+    const staleCalls = [];
+    context.fetch = async (url, options) => {
+        staleCalls.push({url, options});
+        return jsonResponse(url.startsWith('/generate_whisper_transcript/')
+            ? {success: true} : {status: 'complete', transcript: [{text: 'Finished', start: 0}]});
+    };
+    await context.regenerateTranscript({speakersOnly: true});
+    assert(staleCalls.some(call => call.options?.method === 'POST'),
+        'Completed background processing must not block speaker identification');
+    context.renderWhisperProgress({status: 'in_progress'}, Date.now());
+    staleCalls.length = 0;
+    context.fetch = async (url, options) => {
+        staleCalls.push({url, options});
+        return jsonResponse({status: 'in_progress'});
+    };
+    await context.regenerateTranscript({speakersOnly: true});
+    assert.equal(staleCalls.length, 1, 'A real running transcript job is checked but not replaced');
+    assert(!staleCalls.some(call => call.options?.method === 'POST'));
+    context.finishTranscriptAction('another-video');
+    assert(vm.runInContext('activeTranscriptAction !== null', context), 'Cleanup is scoped to its video');
+    context.finishTranscriptAction('video');
+    assert(vm.runInContext('activeTranscriptAction === null', context));
     for (const mode of ['standard', 'fast']) {
         const calls = [];
         context.document.getElementById = id => id === 'speakerMode' ? {value: mode} : null;

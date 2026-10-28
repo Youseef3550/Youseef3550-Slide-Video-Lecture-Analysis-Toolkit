@@ -37,6 +37,11 @@ class ContentHistoryTests(unittest.TestCase):
         path.write_bytes(content)
         history.record(video, "Saved edit", before)
 
+    def test_worker_transcript_snapshots_are_not_undo_content(self):
+        for suffix in ("whisper_pending", "whisper_before_speakers"):
+            (history.TRANSCRIPTS_DIR / f"video_{suffix}.json").write_text("[]")
+        self.assertEqual(set(history.capture("video")), {str(self.transcript.resolve())})
+
     def test_persistent_undo_redo_restores_exact_bytes_and_clears_redo_on_new_edit(self):
         original = self.transcript.read_bytes()
         self.change(self.transcript, b'[{"text":"After"}]')

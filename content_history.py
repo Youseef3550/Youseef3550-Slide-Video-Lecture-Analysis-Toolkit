@@ -70,7 +70,10 @@ def _paths(video_id):
     paths = set(TRANSCRIPTS_DIR.glob(f"{video_id}*.json"))
     # Progress, worker backups and heartbeats are not editable lecture content.
     paths = {path for path in paths if not any(
-        word in path.name for word in ("_phase", "_steps", "_heartbeat", "_backup", "_progress", "_error")
+        word in path.name for word in (
+            "_phase", "_steps", "_heartbeat", "_backup", "_progress", "_error",
+            "_whisper_pending", "_whisper_before_speakers",
+        )
     )}
     paths.update((TRANSCRIPTS_DIR / "versions" / video_id).glob("*.json"))
     paths.update(SUMMARIES_DIR.glob(f"{video_id}*.json"))

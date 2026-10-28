@@ -114,6 +114,10 @@ class TranscriptProcessor:
     def _speaker_backup_path(video_id):
         return TRANSCRIPTS_DIR / f"{video_id}_whisper_before_speakers.json"
 
+    @staticmethod
+    def _pending_transcript_path(video_id):
+        return TRANSCRIPTS_DIR / f"{video_id}_whisper_pending.json"
+
     def restore_interrupted_speaker_jobs(self):
         """Put back transcripts whose speaker identification was cut off by a server restart."""
         try:
@@ -342,6 +346,7 @@ class TranscriptProcessor:
                 return JSONResponse({"success": False, "error": "The existing transcript could not be read."})
             
             # Start background task to generate transcript
+            self._pending_transcript_path(video_id).unlink(missing_ok=True)
             if os.path.exists(output_path):
                 shutil.copyfile(output_path, self._speaker_backup_path(video_id))
                 os.remove(output_path)
@@ -406,6 +411,7 @@ class TranscriptProcessor:
             progress_path.unlink()
 
         # Create progress file
+        self._pending_transcript_path(video_id).unlink(missing_ok=True)
         with open(progress_path, 'w') as f:
             f.write("0")
         log_transcript_step(
@@ -489,6 +495,7 @@ class TranscriptProcessor:
         (TRANSCRIPTS_DIR / f"{video_id}_whisper_progress.txt").unlink(missing_ok=True)
         (TRANSCRIPTS_DIR / f"{video_id}_whisper_error.txt").unlink(missing_ok=True)
         self._remove_whisper_phase(video_id)
+        self._pending_transcript_path(video_id).unlink(missing_ok=True)
         log_transcript_step(video_id, "Processing stopped by the user; the previous transcript was preserved")
         return JSONResponse({"success": True, "transcript": self._read_transcript(video_id)})
 
@@ -610,6 +617,10 @@ class TranscriptProcessor:
             speaker_names = {}
             diarization_error = None
             if diarization:
+                pending = self._pending_transcript_path(video_id)
+                temporary = pending.with_suffix(".tmp")
+                temporary.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+                os.replace(temporary, pending)
                 self._write_whisper_phase(video_id, "identifying_speakers")
                 try:
                     transcript, speaker_names = self.apply_diarization(
@@ -676,6 +687,7 @@ class TranscriptProcessor:
                 os.remove(progress_file)
             self._remove_whisper_phase(video_id)
             self._speaker_backup_path(video_id).unlink(missing_ok=True)
+            self._pending_transcript_path(video_id).unlink(missing_ok=True)
 
         except Exception as e:
             print(f"Error generating Whisper transcript: {str(e)}")
@@ -692,6 +704,7 @@ class TranscriptProcessor:
                 self._speaker_backup_path(video_id).unlink(missing_ok=True)
             with open(str(TRANSCRIPTS_DIR / f"{video_id}_whisper_error.txt"), 'w') as f:
                 f.write(str(e))
+            self._pending_transcript_path(video_id).unlink(missing_ok=True)
 
     async def get_whisper_status(self, video_id: str):
         """Check the status of Whisper transcript generation."""
@@ -720,7 +733,8 @@ class TranscriptProcessor:
                 })
 
             transcript_path = str(TRANSCRIPTS_DIR / f"{video_id}_whisper.json")
-            if os.path.exists(transcript_path):
+            progress_path = str(TRANSCRIPTS_DIR / f"{video_id}_whisper_progress.txt")
+            if os.path.exists(transcript_path) and not os.path.exists(progress_path):
                 try:
                     with open(transcript_path, 'r') as f:
                         transcript = json.load(f)
@@ -745,7 +759,6 @@ class TranscriptProcessor:
                     "metadata": self._public_whisper_metadata(video_id),
                 })
 
-            progress_path = str(TRANSCRIPTS_DIR / f"{video_id}_whisper_progress.txt")
             if os.path.exists(progress_path):
                 try:
                     with open(progress_path, 'r') as f:
@@ -773,12 +786,23 @@ class TranscriptProcessor:
                         "status": "error",
                         "error": stale_message
                     })
+                available_transcript = None
+                if phase == "identifying_speakers":
+                    for candidate in (self._pending_transcript_path(video_id), self._speaker_backup_path(video_id)):
+                        try:
+                            available_transcript = json.loads(candidate.read_text(encoding="utf-8"))
+                        except FileNotFoundError:
+                            continue
+                        if not isinstance(available_transcript, list) or not available_transcript:
+                            raise ValueError("The transcript available during speaker labeling is invalid.")
+                        break
                 return JSONResponse({
                     "success": True,
                     "status": "in_progress",
                     "progress": progress,
                     "phase": phase or ("starting" if progress <= 0 else "transcribing"),
-                    "last_updated_seconds_ago": round(progress_age, 1)
+                    "last_updated_seconds_ago": round(progress_age, 1),
+                    "available_transcript": available_transcript,
                 })
 
             return JSONResponse({

@@ -131,6 +131,9 @@ vm.runInContext(source, context);
     const running = batch => ({status: 'in_progress', phase: 'identifying_speakers',
         steps: [{elapsed: 20, message: `Detecting speakers: embeddings ${batch}%`}], steps_elapsed: 30});
     let statusPolls = 0;
+    const completionTimers = new Map();
+    let timerId = 0;
+    context.clearTimeout = id => completionTimers.delete(id);
     const backgroundRequests = [];
     context.fetch = async (url, options) => {
         backgroundRequests.push({url, options});
@@ -139,7 +142,13 @@ vm.runInContext(source, context);
         return jsonResponse({status: 'complete', transcript: [{text: 'Labeled', start: 0}]});
     };
     const beforeBackgroundLoads = loaded.length;
-    context.setTimeout = callback => setImmediate(() => {
+    context.setTimeout = (callback, milliseconds) => {
+        if (milliseconds === 5000) {
+            const id = ++timerId;
+            completionTimers.set(id, () => { completionTimers.delete(id); callback(); });
+            return id;
+        }
+        return setImmediate(() => {
         if (statusPolls === 1) {
             assert.equal(indicator.hidden, false);
             assert.match(controls['.transcript-job-message'].textContent, /embeddings 25%/);
@@ -155,7 +164,8 @@ vm.runInContext(source, context);
             assert.match(controls['.transcript-job-message'].textContent, /embeddings 50%/);
         }
         callback();
-    });
+        });
+    };
     await context.regenerateTranscript({resumeOnly: true, speakersOnly: true});
     assert.equal(statusPolls, 3, `Browsing does not cancel progress polling: ${errors.at(-1)}`);
     assert.equal(loaded.length, beforeBackgroundLoads + 1, 'Completion preserves the selected saved transcript');
@@ -165,11 +175,15 @@ vm.runInContext(source, context);
     assert.equal(controls['[data-job-stop]'].hidden, true);
     assert.equal(controls['[data-job-dismiss]'].hidden, false);
     assert(vm.runInContext('activeTranscriptAction === null', context));
+    assert.equal(completionTimers.size, 1, 'Completion clears after five seconds');
+    [...completionTimers.values()][0]();
+    assert.equal(indicator.hidden, true);
     context.fetch = async () => jsonResponse({status: 'error', error: "name 'Path' is not defined"});
     await context.regenerateTranscript({resumeOnly: true, speakersOnly: true, background: true});
     assert.match(controls['.transcript-job-message'].textContent, /failed: name 'Path' is not defined/);
     assert.equal(context.elements.transcriptContainer.innerHTML, 'Chosen saved transcript');
     assert.equal(controls['[data-job-details]'].hidden, true);
+    assert.equal(completionTimers.size, 0, 'Errors have no expiration timer');
     controls['[data-job-dismiss]'].onclick();
     assert.equal(indicator.hidden, true);
     context.renderWhisperProgress(running(75), Date.now());
@@ -219,5 +233,25 @@ vm.runInContext(source, context);
     assert.equal(events.filter(event => event.type === 'newTranscriptReady').length, readyBeforeUpload + 1,
         'Uploaded-video completion prompts for chapters/slides even after browsing in the background');
     assert.equal(events.at(-1).detail.videoId, 'uploaded-new');
+    context.renderWhisperProgress(running(10), Date.now());
+    assert.equal(completionTimers.size, 0, 'A prior completion timer must not hide a new job');
+    context.state.currentTranscript = [];
+    context.elements.transcriptContainer.innerHTML = '';
+    context.loadTranscript = transcript => {
+        loaded.push(transcript);
+        context.state.currentTranscript = transcript;
+        context.elements.generateSummaryBtn.disabled = !transcript.length;
+        context.elements.transcriptContainer.innerHTML = transcript[0]?.text || '';
+    };
+    context.renderWhisperProgress({...running(50), available_transcript: [
+        {start: 0, text: 'Available before speakers finish'},
+    ]}, Date.now());
+    assert.equal(context.state.currentTranscript[0].text, 'Available before speakers finish');
+    assert.equal(context.elements.generateSummaryBtn.disabled, false);
+    assert.equal(context.elements.transcriptContainer.innerHTML, 'Available before speakers finish');
+    assert.match(controls['.transcript-job-message'].textContent, /embeddings 50%/);
+    context.renderWhisperProgress({...running(60), available_transcript: [{text: 'Other snapshot'}]}, Date.now());
+    assert.equal(context.state.currentTranscript[0].text, 'Available before speakers finish',
+        'Further speaker polls must not replace the transcript being used for chapters');
     console.log('PASS: reconnect to transcription progress without restarting the job');
 })().catch(error => {console.error(error); process.exitCode = 1;});

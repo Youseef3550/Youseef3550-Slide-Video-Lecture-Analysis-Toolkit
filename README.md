@@ -220,6 +220,12 @@ These are the changes specifically described as fixes to the inherited project. 
   across tabs, with **Show progress** and **Stop** controls. Background polling continues
   when browsing saved transcripts; completion offers **View result**, and failures
   remain visible until dismissed without replacing the transcript being viewed.
+  While speakers are being labeled, the existing transcript (or newly completed
+  speech-to-text result) stays available after reopening the video, so topic and
+  timestamp chapters can be generated without waiting for speaker labels.
+  The highlighted next-step prompt stays visible near the top while scrolling.
+  Transcript completion status clears after five seconds; failures stay visible
+  until dismissed.
   Reopening a saved video reconnects to the running job's steps and refreshes
   the saved-transcript selector even when the current transcript is still processing.
 - **Saved Video Loading**: Saved transcripts and scenes are read as UTF-8,

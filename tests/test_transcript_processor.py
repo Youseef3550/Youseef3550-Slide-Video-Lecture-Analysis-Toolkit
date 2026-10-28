@@ -39,6 +39,33 @@ from processors.transcript_processor import TranscriptProcessor
 
 
 class TranscriptProcessorReuseTests(unittest.TestCase):
+    def test_running_speaker_status_exposes_existing_transcript_without_completing(self):
+        for snapshot in ("before_speakers", "pending"):
+            with self.subTest(snapshot=snapshot), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)):
+                root = Path(directory)
+                transcript = [{"start": 0, "text": "Use this for chapters"}]
+                (root / f"vid_whisper_{snapshot}.json").write_text(json.dumps(transcript), encoding="utf-8")
+                (root / "vid_whisper_progress.txt").write_text("100")
+                (root / "vid_whisper_phase.txt").write_text("identifying_speakers")
+                # Activating a saved version may recreate the primary file during labeling.
+                (root / "vid_whisper.json").write_text(json.dumps(transcript), encoding="utf-8")
+                response = asyncio.run(TranscriptProcessor().get_whisper_status("vid"))
+                self.assertEqual(response.content["status"], "in_progress")
+                self.assertEqual(response.content["available_transcript"], transcript)
+                self.assertNotIn("transcript", response.content)
+
+    def test_invalid_speaker_snapshot_surfaces_an_error(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)):
+            root = Path(directory)
+            (root / "vid_whisper_pending.json").write_text("not JSON")
+            (root / "vid_whisper_progress.txt").write_text("100")
+            (root / "vid_whisper_phase.txt").write_text("identifying_speakers")
+            response = asyncio.run(TranscriptProcessor().get_whisper_status("vid"))
+            self.assertEqual(response.content["status"], "error")
+            self.assertTrue(response.content["error"])
+
     def test_speaker_click_reconnects_to_running_job_when_transcript_is_backed_up(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)), \
@@ -220,10 +247,14 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
             transcript_module.transcribe_audio = self._unexpected_transcription
             try:
                 processor = TranscriptProcessor()
-                processor.apply_diarization = mock.Mock(side_effect=lambda path, transcript, **kwargs: (
-                    [{**item, "speaker": "SPEAKER_00"} for item in transcript],
-                    {"SPEAKER_00": "Speaker 00"},
-                ))
+                def label_speakers(path, transcript, **kwargs):
+                    pending = processor._pending_transcript_path("video")
+                    self.assertEqual(json.loads(pending.read_text(encoding="utf-8")), transcript)
+                    return (
+                        [{**item, "speaker": "SPEAKER_00"} for item in transcript],
+                        {"SPEAKER_00": "Speaker 00"},
+                    )
+                processor.apply_diarization = mock.Mock(side_effect=label_speakers)
                 output_path = Path(directory) / "video_whisper.json"
                 existing = [{"text": "Hello", "start": 0, "duration": 1}]
                 backup = Path(directory) / "video_whisper_before_speakers.json"
@@ -250,6 +281,7 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
                 self.assertEqual(processor.apply_diarization.call_args.kwargs["speaker_mode"], "fast")
                 self.assertEqual(processor._public_whisper_metadata("video")["speaker_mode"], "fast")
                 self.assertFalse(backup.exists())
+                self.assertFalse(processor._pending_transcript_path("video").exists())
                 self.assertFalse((Path(directory) / "video_whisper_error.txt").exists())
                 self.assertFalse(
                     (Path(directory) / "video_whisper_progress.txt").exists()

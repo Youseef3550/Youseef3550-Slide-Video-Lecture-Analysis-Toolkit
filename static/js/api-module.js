@@ -37,10 +37,13 @@ function applyActiveTranscriptSource(data, videoId) {
 let activeTranscriptAction = null;
 let transcriptBrowsingVideoId = null;
 let transcriptSelectedVideoId = null;
+let transcriptCompletionTimer = null;
 
 function renderCompactTranscriptProgress(status, startedAt, initiatingButton) {
     const indicator = document.getElementById('transcriptJobStatus');
     if (!indicator) return;
+    clearTimeout(transcriptCompletionTimer);
+    transcriptCompletionTimer = null;
     const videoId = state.currentVideoId;
     const failed = status.status === 'error';
     const complete = status.status === 'complete';
@@ -49,6 +52,10 @@ function renderCompactTranscriptProgress(status, startedAt, initiatingButton) {
     const step = status.steps?.at(-1)?.message;
     const progress = Number(status.progress);
     indicator.hidden = false;
+    if (complete) transcriptCompletionTimer = setTimeout(() => {
+        indicator.hidden = true;
+        transcriptCompletionTimer = null;
+    }, 5000);
     indicator.querySelector('.transcript-job-message').textContent = failed
         ? `${label} failed: ${status.error || 'Unknown error'}`
         : complete ? `${label} complete`
@@ -80,10 +87,16 @@ function renderCompactTranscriptProgress(status, startedAt, initiatingButton) {
     stop.onclick = () => activeTranscriptAction?.videoId === videoId && activeTranscriptAction.stop();
     const dismiss = indicator.querySelector('[data-job-dismiss]');
     dismiss.hidden = !terminal;
-    dismiss.onclick = () => { indicator.hidden = true; };
+    dismiss.onclick = () => {
+        clearTimeout(transcriptCompletionTimer);
+        transcriptCompletionTimer = null;
+        indicator.hidden = true;
+    };
 }
 
 document.addEventListener('videoSelectionChanged', () => {
+    clearTimeout(transcriptCompletionTimer);
+    transcriptCompletionTimer = null;
     if (activeTranscriptAction) finishTranscriptAction(activeTranscriptAction.videoId);
     transcriptBrowsingVideoId = null;
     transcriptSelectedVideoId = null;
@@ -290,6 +303,12 @@ export function renderTranscriptSteps(status, { running = true } = {}) {
 }
 
 function renderWhisperProgress(status, startedAt, initiatingButton = null) {
+    if (!state.currentTranscript?.length && status.available_transcript?.length) {
+        state.currentTranscriptSource = 'whisper';
+        loadTranscript(status.available_transcript);
+        transcriptBrowsingVideoId = state.currentVideoId;
+        transcriptSelectedVideoId = null;
+    }
     const progress = Number.isFinite(Number(status.progress))
         ? Math.max(0, Math.min(100, Number(status.progress)))
         : 0;

@@ -252,8 +252,9 @@
             <p>Loading video and processing data...</p>
         </div>
 
-        <section id="transcriptReadyPrompt" class="transcript-ready-prompt" aria-labelledby="transcriptReadyHeading" hidden>
-            <strong id="transcriptReadyHeading">Transcript ready. What would you like to start?</strong>
+        <section id="transcriptReadyPrompt" class="transcript-ready-prompt" aria-labelledby="transcriptReadyHeading" aria-live="polite" hidden>
+            <strong id="transcriptReadyHeading"><i class="fas fa-check-circle" aria-hidden="true"></i> Transcript ready. Choose your next step</strong>
+            <p>Create chapters, detect slides, or start both together.</p>
             <div class="row-actions">
                 <button class="btn btn-primary" type="button" data-ready-action="chapters">Chapters</button>
                 <button class="btn btn-secondary" type="button" data-ready-action="slides">Slides</button>

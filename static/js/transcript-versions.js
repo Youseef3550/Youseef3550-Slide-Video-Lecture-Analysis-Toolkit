@@ -158,7 +158,7 @@ export async function chooseTranscriptVersion(versionId) {
         if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
         if (videoId !== state.currentVideoId) return;
         const version = data.version;
-        state.whisperTranscriptPollGeneration = (state.whisperTranscriptPollGeneration || 0) + 1;
+        document.dispatchEvent(new CustomEvent('transcriptVersionSelected'));
         state.currentTranscriptVersionId = version.id;
         const targetSelect = document.getElementById('translationTarget');
         if (version.kind === 'translation') {

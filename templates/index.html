@@ -262,6 +262,13 @@
                 <label><input id="rememberTranscriptReady" type="checkbox"> Always do this when I upload new videos</label>
             </div>
         </section>
+        <section id="transcriptJobStatus" class="transcript-job-status" aria-label="Transcript processing" hidden>
+            <progress aria-label="Transcript processing progress"></progress>
+            <span class="transcript-job-message" role="status"></span>
+            <button type="button" class="btn btn-secondary" data-job-details>Show progress</button>
+            <button type="button" class="btn btn-secondary" data-job-stop>Stop</button>
+            <button type="button" class="btn btn-secondary" data-job-dismiss hidden>Dismiss</button>
+        </section>
         <div class="main-content">
             <!-- Left column: Video player and timeline -->
             <div class="video-container">

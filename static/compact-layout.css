@@ -55,6 +55,33 @@ select,
     display: none;
 }
 
+.transcript-job-status {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 4px 8px;
+    margin-top: 6px;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.transcript-job-status[hidden],
+.transcript-job-status [hidden] {
+    display: none;
+}
+
+.transcript-job-status progress {
+    width: 70px;
+    height: 6px;
+}
+
+.transcript-job-message {
+    flex: 1 1 180px;
+    overflow-wrap: anywhere;
+}
+
 .main-content {
     grid-template-columns: minmax(0, 1fr) clamp(300px, 28vw, 400px);
     gap: 10px;

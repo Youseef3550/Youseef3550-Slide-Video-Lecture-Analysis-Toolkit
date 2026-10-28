@@ -5,6 +5,7 @@ import time
 import asyncio
 import threading
 import multiprocessing
+from pathlib import Path
 from fastapi.responses import JSONResponse
 from youtube_transcript_api import YouTubeTranscriptApi
 from transcribe import (

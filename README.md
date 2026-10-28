@@ -216,6 +216,10 @@ These are the changes specifically described as fixes to the inherited project. 
 - **Processing Controls**: Stop transcription/speaker detection and restore the
   previous transcript, or keep processing in the background while browsing saved
   transcripts. Selecting a saved version prevents progress polling from replacing it.
+  A compact status strip above the workspace keeps the latest processing step visible
+  across tabs, with **Show progress** and **Stop** controls. Background polling continues
+  when browsing saved transcripts; completion offers **View result**, and failures
+  remain visible until dismissed without replacing the transcript being viewed.
   Reopening a saved video reconnects to the running job's steps and refreshes
   the saved-transcript selector even when the current transcript is still processing.
 - **Saved Video Loading**: Saved transcripts and scenes are read as UTF-8,

@@ -35,15 +35,80 @@ function applyActiveTranscriptSource(data, videoId) {
 }
 
 let activeTranscriptAction = null;
+let transcriptBrowsingVideoId = null;
+let transcriptSelectedVideoId = null;
+
+function renderCompactTranscriptProgress(status, startedAt, initiatingButton) {
+    const indicator = document.getElementById('transcriptJobStatus');
+    if (!indicator) return;
+    const videoId = state.currentVideoId;
+    const failed = status.status === 'error';
+    const complete = status.status === 'complete';
+    const terminal = failed || complete || status.status === 'cancelled';
+    const label = status.phase === 'identifying_speakers' ? 'Labeling speakers' : 'Transcript processing';
+    const step = status.steps?.at(-1)?.message;
+    const progress = Number(status.progress);
+    indicator.hidden = false;
+    indicator.querySelector('.transcript-job-message').textContent = failed
+        ? `${label} failed: ${status.error || 'Unknown error'}`
+        : complete ? `${label} complete`
+        : terminal ? `${label} stopped`
+        : `${label}: ${step || (progress > 0 && status.phase !== 'identifying_speakers'
+            ? `${Math.round(progress)}%` : 'Working...')}`;
+    const meter = indicator.querySelector('progress');
+    meter.hidden = terminal;
+    if (status.phase !== 'identifying_speakers' && Number.isFinite(progress) && progress > 0) {
+        meter.max = 100;
+        meter.value = Math.max(0, Math.min(100, progress));
+    } else {
+        meter.removeAttribute('value');
+    }
+    const details = indicator.querySelector('[data-job-details]');
+    details.hidden = failed || status.status === 'cancelled' || (!complete && transcriptBrowsingVideoId !== videoId);
+    details.textContent = complete ? 'View result' : 'Show progress';
+    details.onclick = () => {
+        if (state.currentVideoId !== videoId) return;
+        document.querySelector('[data-tab="transcript"]')?.click();
+        transcriptBrowsingVideoId = null;
+        transcriptSelectedVideoId = null;
+        if (complete) void regenerateTranscript({resumeOnly: true, speakersOnly: status.phase === 'identifying_speakers'});
+        else renderWhisperProgress(status, startedAt, initiatingButton);
+    };
+    const stop = indicator.querySelector('[data-job-stop]');
+    stop.hidden = terminal;
+    stop.disabled = !!status.pending_start;
+    stop.onclick = () => activeTranscriptAction?.videoId === videoId && activeTranscriptAction.stop();
+    const dismiss = indicator.querySelector('[data-job-dismiss]');
+    dismiss.hidden = !terminal;
+    dismiss.onclick = () => { indicator.hidden = true; };
+}
+
+document.addEventListener('videoSelectionChanged', () => {
+    if (activeTranscriptAction) finishTranscriptAction(activeTranscriptAction.videoId);
+    transcriptBrowsingVideoId = null;
+    transcriptSelectedVideoId = null;
+    const indicator = document.getElementById('transcriptJobStatus');
+    if (indicator) indicator.hidden = true;
+});
+
+document.addEventListener('transcriptVersionSelected', () => {
+    if (activeTranscriptAction?.videoId !== state.currentVideoId) return;
+    transcriptBrowsingVideoId = state.currentVideoId;
+    transcriptSelectedVideoId = state.currentVideoId;
+    renderCompactTranscriptProgress(activeTranscriptAction.status, activeTranscriptAction.startedAt);
+});
 
 function transcriptReady(videoId) {
     document.dispatchEvent(new CustomEvent('newTranscriptReady', { detail: { videoId } }));
 }
 
-function finishTranscriptAction(videoId) {
+function finishTranscriptAction(videoId, status = null) {
     if (activeTranscriptAction?.videoId !== videoId) return;
     finishProcessButton(activeTranscriptAction.button);
     activeTranscriptAction = null;
+    if (status && state.currentVideoId === videoId) renderCompactTranscriptProgress(status);
+    transcriptBrowsingVideoId = null;
+    transcriptSelectedVideoId = null;
 }
 
 export async function regenerateTranscript(options = {}) {
@@ -56,7 +121,7 @@ export async function regenerateTranscript(options = {}) {
             const response = await fetch(`/whisper_transcript_status/${encodeURIComponent(action.videoId)}`);
             const status = await readJsonResponse(response, 'Checking transcript processing');
             if (['complete', 'error'].includes(status.status)) {
-                if (activeTranscriptAction === action) finishTranscriptAction(action.videoId);
+                if (activeTranscriptAction === action) finishTranscriptAction(action.videoId, status);
             }
         } catch (error) {
             showError(`Could not check transcript processing: ${error.message}`);
@@ -90,6 +155,9 @@ export async function regenerateTranscript(options = {}) {
     }
     const pollGeneration = ++state.whisperTranscriptPollGeneration;
     const startedAt = Date.now();
+    transcriptBrowsingVideoId = options.background ? videoId : null;
+    transcriptSelectedVideoId = options.background && state.currentTranscript.length ? videoId : null;
+    let finalStatus = null;
     renderWhisperProgress({ status: 'queued', progress: 0, pending_start: !options.resumeOnly }, startedAt, button);
     try {
         if (!options.resumeOnly) {
@@ -133,11 +201,16 @@ export async function regenerateTranscript(options = {}) {
             const status = await readJsonResponse(statusResponse, 'Transcript status');
             if (state.currentVideoId !== videoId || state.whisperTranscriptPollGeneration !== pollGeneration) return;
             if (status.status === 'complete') {
-                state.currentTranscriptSource = 'whisper';
-                loadTranscript(applySpeakerNames(status.transcript, status.speaker_names || {}));
-                renderSpeakerNames(status.speaker_names || {});
-                if (!speakersOnly) transcriptReady(videoId);
-                showNotification(`Transcript generated with ${describeTranscriptionModel(status.model || model)}.`, 'success');
+                finalStatus = {...status, phase: activeTranscriptAction?.status.phase};
+                if (transcriptSelectedVideoId !== videoId) {
+                    state.currentTranscriptSource = 'whisper';
+                    loadTranscript(applySpeakerNames(status.transcript, status.speaker_names || {}));
+                    renderSpeakerNames(status.speaker_names || {});
+                }
+                if (!speakersOnly && transcriptSelectedVideoId !== videoId) transcriptReady(videoId);
+                void refreshTranscriptVersions();
+                showNotification(speakersOnly ? 'Speaker identification complete. Use View result to see the labels.'
+                    : `Transcript generated with ${describeTranscriptionModel(status.model || model)}.`, 'success');
                 if (status.metadata?.diarization_error) {
                     showError(
                         `The transcript was kept, but speaker identification failed: ${status.metadata.diarization_error}`
@@ -151,42 +224,37 @@ export async function regenerateTranscript(options = {}) {
                 throw error;
             }
             renderWhisperProgress(status, startedAt, button);
-            const browse = document.getElementById('browseDuringTranscriptionBtn');
-            if (browse) browse.onclick = () => {
-                state.whisperTranscriptPollGeneration++;
-                loadTranscript(originalTranscript);
-                finishProcessButton(button);
-                if (button) { button.disabled = false; button.textContent = idleLabel; }
-                activeTranscriptAction = null;
-                button?.removeAttribute('aria-busy');
-                showNotification('Processing continues in the background. You can choose a saved transcript above.', 'info');
-            };
             await delay(3000);
         }
     } catch (error) {
+        if (state.currentVideoId !== videoId || state.whisperTranscriptPollGeneration !== pollGeneration) return;
+        finalStatus = {status: 'error', error: error.message, phase: activeTranscriptAction?.status.phase};
         const lastStep = error.steps?.steps?.at(-1)?.message;
         showError(
             `Error regenerating transcript: ${error.message}`
             + (lastStep && lastStep !== error.message ? ` (last step: ${lastStep})` : '')
         );
-        if (originalTranscript.length) {
-            loadTranscript(originalTranscript);
-        } else {
-            elements.transcriptContainer.innerHTML = `
+        if (transcriptBrowsingVideoId !== videoId) {
+            if (originalTranscript.length) {
+                loadTranscript(originalTranscript);
+            } else {
+                elements.transcriptContainer.innerHTML = `
                 <div class="transcript-processing transcript-error">
                     <i class="fas fa-info-circle"></i>
                     <p>Transcript regeneration stopped. ${escapeHtml(error.message)}</p>
                     ${renderTranscriptSteps(error.steps, { running: false })}
                 </div>
             `;
+            }
         }
     } finally {
-        finishProcessButton(button);
-        activeTranscriptAction = null;
-        button?.removeAttribute('aria-busy');
-        if (button && state.whisperTranscriptPollGeneration === pollGeneration) {
-            button.disabled = false;
-            button.textContent = idleLabel;
+        if (state.whisperTranscriptPollGeneration === pollGeneration) {
+            finishTranscriptAction(videoId, finalStatus);
+            if (button) {
+                button.removeAttribute('aria-busy');
+                button.disabled = false;
+                button.textContent = idleLabel;
+            }
         }
     }
 }
@@ -235,7 +303,8 @@ function renderWhisperProgress(status, startedAt, initiatingButton = null) {
     const lastUpdate = Number.isFinite(Number(status.last_updated_seconds_ago))
         ? ` Server heartbeat: ${Math.round(Number(status.last_updated_seconds_ago))}s ago.`
         : '';
-    elements.transcriptContainer.innerHTML = `
+    if (transcriptBrowsingVideoId !== state.currentVideoId) {
+        elements.transcriptContainer.innerHTML = `
         <div class="transcript-processing">
             <i class="fas fa-spinner fa-spin"></i>
             <div class="progress-container">
@@ -251,22 +320,33 @@ function renderWhisperProgress(status, startedAt, initiatingButton = null) {
             <button id="browseDuringTranscriptionBtn" type="button" class="btn btn-secondary">Keep processing and view transcript</button>
         </div>
     `;
-    startElapsedTimer(elements.transcriptContainer, elapsedSeconds);
+        startElapsedTimer(elements.transcriptContainer, elapsedSeconds);
+        const browse = document.getElementById('browseDuringTranscriptionBtn');
+        if (browse) browse.onclick = () => {
+            transcriptBrowsingVideoId = state.currentVideoId;
+            loadTranscript(state.currentTranscript);
+            renderCompactTranscriptProgress(status, startedAt, initiatingButton);
+            showNotification('Processing continues in the background. Progress and Stop remain above the workspace.', 'info');
+        };
+    }
+    renderCompactTranscriptProgress(status, startedAt, initiatingButton);
     const button = initiatingButton || activeTranscriptAction?.button
         || (status.phase === 'identifying_speakers' ? document.getElementById('identifySpeakersBtn') : elements.regenerateTranscriptBtn);
     const process = startProcessButton(button, status.phase === 'identifying_speakers' ? 'Labeling speakers' : 'Generating transcript',
         {cancellable: !status.pending_start, elapsedSeconds});
     if (status.phase === 'transcribing') process.update({percent: progress});
-    activeTranscriptAction = {videoId: state.currentVideoId, button, stop: async () => {
+    const videoId = state.currentVideoId;
+    activeTranscriptAction = {videoId, button, status, startedAt, stop: async () => {
+        if (state.currentVideoId !== videoId) return;
         process.update({stopping: true});
         try {
-            const response = await fetch(`/cancel_whisper_transcript/${encodeURIComponent(state.currentVideoId)}`, {method: 'POST'});
+            const response = await fetch(`/cancel_whisper_transcript/${encodeURIComponent(videoId)}`, {method: 'POST'});
             const data = await readJsonResponse(response, 'Stopping transcription');
             if (!data.success) throw new Error(data.error);
+            if (state.currentVideoId !== videoId) return;
             state.whisperTranscriptPollGeneration++;
             loadTranscript(data.transcript || []);
-            finishProcessButton(button);
-            activeTranscriptAction = null;
+            finishTranscriptAction(videoId, {status: 'cancelled'});
             const regenerate = elements.regenerateTranscriptBtn;
             if (regenerate) { regenerate.disabled = false; regenerate.textContent = 'Regenerate transcript'; }
             const speakers = document.getElementById('identifySpeakersBtn');
@@ -754,15 +834,20 @@ async function startYoutubeWhisperPolling(videoId) {
 
     const pollStartedAt = Date.now();
     const checkStatus = async () => {
+        if (state.currentVideoId !== videoId) return true;
         const response = await fetch(`/whisper_transcript_status/${videoId}`);
         const data = await response.json();
+        if (state.currentVideoId !== videoId) return true;
         if (data.status === 'in_progress') {
             renderWhisperProgress(data, pollStartedAt);
             return false;
         }
         if (data.status === 'complete' && Array.isArray(data.transcript)) {
-            finishTranscriptAction(videoId);
-            updateTranscript(data.transcript);
+            const browsing = transcriptSelectedVideoId === videoId;
+            finishTranscriptAction(videoId, data);
+            if (!browsing) updateTranscript(data.transcript);
+            else showNotification('Transcript processing complete. Use View result to see it.', 'success');
+            void refreshTranscriptVersions();
             if (state.youtubeTranscriptInterval) {
                 clearInterval(state.youtubeTranscriptInterval);
                 state.youtubeTranscriptInterval = null;
@@ -770,12 +855,13 @@ async function startYoutubeWhisperPolling(videoId) {
             return true;
         }
         if (data.status === 'error') {
-            finishTranscriptAction(videoId);
+            const browsing = transcriptBrowsingVideoId === videoId;
+            finishTranscriptAction(videoId, data);
             if (state.youtubeTranscriptInterval) {
                 clearInterval(state.youtubeTranscriptInterval);
                 state.youtubeTranscriptInterval = null;
             }
-            elements.transcriptContainer.innerHTML = `
+            if (!browsing) elements.transcriptContainer.innerHTML = `
                 <div class="transcript-processing transcript-error">
                     <i class="fas fa-info-circle"></i>
                     <p>Transcript generation stopped: ${escapeHtml(data.error || 'No recognizable speech was found in this video.')}</p>
@@ -783,7 +869,7 @@ async function startYoutubeWhisperPolling(videoId) {
                     ${renderTranscriptSteps(data, { running: false })}
                 </div>
             `;
-            elements.generateSummaryBtn.disabled = true;
+            if (!browsing) elements.generateSummaryBtn.disabled = true;
             elements.exportChaptersBtn.disabled = false;
             throw new Error(data.error || 'Whisper transcript generation failed.');
         }
@@ -1092,6 +1178,7 @@ export async function processVideo() {
             } else {
                 elements.chaptersContainer.innerHTML = '<p>Click "Generate chapters" to create chapter markers from the transcript.</p>';
             }
+            if (data.transcript_in_progress) void regenerateTranscript({resumeOnly: true, background: true});
 
             // Update transcript display
             loadTranscript(transcriptToUse);
@@ -1242,27 +1329,35 @@ export async function processVideoUpload(file) {
                 try {
                     const whisperResponse = await fetch(`/whisper_transcript_status/${data.video_id}`);
                     const whisperData = await readJsonResponse(whisperResponse, 'Transcript status');
+                    if (state.currentVideoId !== data.video_id) {
+                        if (whisperCheckInterval) clearInterval(whisperCheckInterval);
+                        return;
+                    }
                     
                     if (whisperData.status === 'complete') {
-                        finishTranscriptAction(data.video_id);
+                        const browsing = transcriptSelectedVideoId === data.video_id;
+                        finishTranscriptAction(data.video_id, whisperData);
                         if (whisperCheckInterval) clearInterval(whisperCheckInterval);
                         
                         // Transcript is ready, update UI
                         showNotification('Whisper transcript generation complete!', 'success');
                         
                         // Update current transcript
-                        state.currentTranscript = whisperData.transcript;
-                        state.currentTranscriptSource = 'whisper';
-                        
-                        // Update transcript display
-                        loadTranscript(whisperData.transcript);
+                        if (!browsing) {
+                            state.currentTranscript = whisperData.transcript;
+                            state.currentTranscriptSource = 'whisper';
+                            loadTranscript(whisperData.transcript);
+                            transcriptReady(data.video_id);
+                        }
+                        void refreshTranscriptVersions();
                         
                         // Enable generate summary button
                         elements.generateSummaryBtn.disabled = false;
                     } else if (whisperData.status === 'error') {
-                        finishTranscriptAction(data.video_id);
+                        const browsing = transcriptBrowsingVideoId === data.video_id;
+                        finishTranscriptAction(data.video_id, whisperData);
                         if (whisperCheckInterval) clearInterval(whisperCheckInterval);
-                        elements.transcriptContainer.innerHTML = `
+                        if (!browsing) elements.transcriptContainer.innerHTML = `
                             <div class="transcript-processing transcript-error">
                                 <i class="fas fa-info-circle"></i>
                                 <p>Transcript generation stopped: ${escapeHtml(whisperData.error || 'No recognizable speech was found in this video.')}</p>
@@ -1270,7 +1365,7 @@ export async function processVideoUpload(file) {
                                 ${renderTranscriptSteps(whisperData, { running: false })}
                             </div>
                         `;
-                        elements.generateSummaryBtn.disabled = true;
+                        if (!browsing) elements.generateSummaryBtn.disabled = true;
                         elements.exportChaptersBtn.disabled = false;
                         showError(`Error generating transcript: ${whisperData.error}`);
                     } else {
@@ -1410,6 +1505,7 @@ export async function loadUploadedVideo(videoId, mediaExportId = null) {
             if (summaryData.success && summaryData.exists) {
                 updateChapters(summaryData.chapters);
             }
+            if (data.transcript_in_progress) void regenerateTranscript({resumeOnly: true, background: true});
         } else if (data.transcript_in_progress) {
             void regenerateTranscript({resumeOnly: true});
         } else {

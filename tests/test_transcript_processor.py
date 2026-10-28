@@ -226,6 +226,8 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
                 ))
                 output_path = Path(directory) / "video_whisper.json"
                 existing = [{"text": "Hello", "start": 0, "duration": 1}]
+                backup = Path(directory) / "video_whisper_before_speakers.json"
+                backup.write_text(json.dumps(existing), encoding="utf-8")
                 (Path(directory) / "video_whisper_progress.txt").write_text(
                     "100", encoding="utf-8"
                 )
@@ -247,6 +249,8 @@ class TranscriptProcessorReuseTests(unittest.TestCase):
                 )
                 self.assertEqual(processor.apply_diarization.call_args.kwargs["speaker_mode"], "fast")
                 self.assertEqual(processor._public_whisper_metadata("video")["speaker_mode"], "fast")
+                self.assertFalse(backup.exists())
+                self.assertFalse((Path(directory) / "video_whisper_error.txt").exists())
                 self.assertFalse(
                     (Path(directory) / "video_whisper_progress.txt").exists()
                 )

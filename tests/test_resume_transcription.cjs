@@ -9,6 +9,7 @@ const loaded = [];
 const errors = [];
 const timers = [];
 const events = [];
+const listeners = {};
 const context = vm.createContext({
     startProcessButton: require('./process_button_stub.cjs'),
     finishProcessButton: require('./process_button_stub.cjs').finish,
@@ -20,10 +21,15 @@ const context = vm.createContext({
     CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
     state: {currentVideoId: 'video', currentTranscript: [], whisperTranscriptPollGeneration: 0},
     elements: {transcriptContainer: {}, regenerateTranscriptBtn: {textContent: 'Regenerate', removeAttribute() {}}},
-    document: {getElementById: () => null, addEventListener: () => {}, dispatchEvent(event) { events.push(event); }},
+    document: {getElementById: () => null, querySelector: () => null, createElement: () => ({
+        textContent: '', get innerHTML() { return this.textContent; },
+    }),
+        addEventListener: (type, handler) => { listeners[type] = handler; },
+        dispatchEvent(event) { events.push(event); }},
     showError: (message) => { if (message) errors.push(message); },
     showNotification: () => {},
     loadTranscript: (transcript) => loaded.push(transcript),
+    refreshTranscriptVersions: async () => {},
     fetch: async (url) => {
         requests.push(url);
         return {ok: true, status: 200, text: async () => JSON.stringify({
@@ -112,5 +118,106 @@ vm.runInContext(source, context);
     await context.regenerateTranscript({speakersOnly: true});
     assert.deepEqual(unsupportedRequests.map(call => call.url), ['/runtime_status']);
     assert.match(errors.at(-1), /Fast speaker mode needs a server restart/);
+    const controls = Object.fromEntries(['.transcript-job-message', 'progress', '[data-job-details]',
+        '[data-job-stop]', '[data-job-dismiss]'].map(key => [key, {
+        hidden: false, removeAttribute(name) { delete this[name]; },
+    }]));
+    const indicator = {hidden: true, querySelector: key => controls[key]};
+    const browse = {};
+    context.document.getElementById = id => ({
+        transcriptJobStatus: indicator, browseDuringTranscriptionBtn: browse,
+        identifySpeakersBtn: speakerButton, speakerMode: {value: 'standard'},
+    })[id] || null;
+    const running = batch => ({status: 'in_progress', phase: 'identifying_speakers',
+        steps: [{elapsed: 20, message: `Detecting speakers: embeddings ${batch}%`}], steps_elapsed: 30});
+    let statusPolls = 0;
+    const backgroundRequests = [];
+    context.fetch = async (url, options) => {
+        backgroundRequests.push({url, options});
+        statusPolls++;
+        if (statusPolls <= 2) return jsonResponse(running(statusPolls * 25));
+        return jsonResponse({status: 'complete', transcript: [{text: 'Labeled', start: 0}]});
+    };
+    const beforeBackgroundLoads = loaded.length;
+    context.setTimeout = callback => setImmediate(() => {
+        if (statusPolls === 1) {
+            assert.equal(indicator.hidden, false);
+            assert.match(controls['.transcript-job-message'].textContent, /embeddings 25%/);
+            assert.equal(controls.progress.value, undefined, 'Speaker percent is a substep, not overall progress');
+            browse.onclick();
+            assert.equal(controls['[data-job-details]'].hidden, false);
+            assert.equal(controls['[data-job-stop]'].hidden, false);
+            context.elements.transcriptContainer.innerHTML = 'Chosen saved transcript';
+            context.state.currentTranscript = [{text: 'Chosen saved transcript'}];
+            listeners.transcriptVersionSelected();
+        } else {
+            assert.equal(context.elements.transcriptContainer.innerHTML, 'Chosen saved transcript');
+            assert.match(controls['.transcript-job-message'].textContent, /embeddings 50%/);
+        }
+        callback();
+    });
+    await context.regenerateTranscript({resumeOnly: true, speakersOnly: true});
+    assert.equal(statusPolls, 3, `Browsing does not cancel progress polling: ${errors.at(-1)}`);
+    assert.equal(loaded.length, beforeBackgroundLoads + 1, 'Completion preserves the selected saved transcript');
+    assert(!backgroundRequests.some(request => request.options?.method === 'POST'));
+    assert.match(controls['.transcript-job-message'].textContent, /complete/);
+    assert.equal(controls['[data-job-details]'].textContent, 'View result');
+    assert.equal(controls['[data-job-stop]'].hidden, true);
+    assert.equal(controls['[data-job-dismiss]'].hidden, false);
+    assert(vm.runInContext('activeTranscriptAction === null', context));
+    context.fetch = async () => jsonResponse({status: 'error', error: "name 'Path' is not defined"});
+    await context.regenerateTranscript({resumeOnly: true, speakersOnly: true, background: true});
+    assert.match(controls['.transcript-job-message'].textContent, /failed: name 'Path' is not defined/);
+    assert.equal(context.elements.transcriptContainer.innerHTML, 'Chosen saved transcript');
+    assert.equal(controls['[data-job-details]'].hidden, true);
+    controls['[data-job-dismiss]'].onclick();
+    assert.equal(indicator.hidden, true);
+    context.renderWhisperProgress(running(75), Date.now());
+    browse.onclick();
+    controls['[data-job-details]'].onclick();
+    assert.match(context.elements.transcriptContainer.innerHTML, /transcript-processing/);
+    context.fetch = async (url, options) => {
+        assert.equal(url, '/cancel_whisper_transcript/video');
+        assert.equal(options.method, 'POST');
+        return jsonResponse({success: true, transcript: [{text: 'Restored'}]});
+    };
+    await controls['[data-job-stop]'].onclick();
+    assert.match(controls['.transcript-job-message'].textContent, /stopped/);
+    assert(vm.runInContext('activeTranscriptAction === null', context));
+    context.renderWhisperProgress(running(80), Date.now());
+    listeners.videoSelectionChanged();
+    assert.equal(indicator.hidden, true, 'Old project progress does not leak into another project');
+    assert.match(template, /id="transcriptJobStatus"[\s\S]*?<\/section>\s*<div class="main-content">/);
+
+    // Exercise the real asynchronous upload-completion path, not just its ready-event helper.
+    context.state.currentTranscript = [];
+    context.resetVideoStates = () => listeners.videoSelectionChanged();
+    context.FormData = class { append() {} };
+    context.showLoading = () => {};
+    context.setupVideoPlayer = () => {};
+    context.elements.loadingIndicator = {querySelector: () => ({})};
+    context.elements.generateSummaryBtn = {};
+    context.elements.exportChaptersBtn = {};
+    context.elements.detectScenesBtn = {};
+    context.elements.scenesContainer = {};
+    context.elements.videoPlayer = {
+        set src(value) { setImmediate(() => this.onloadedmetadata()); },
+    };
+    context.uploadVideoWithProgress = async () => ({json: async () => ({
+        success: true, video_id: 'uploaded-new', video_url: '/video/uploaded-new', transcript_in_progress: true,
+    })});
+    let finishUpload;
+    context.fetch = async () => new Promise(resolve => { finishUpload = resolve; });
+    context.setInterval = () => 1;
+    context.clearInterval = () => {};
+    const readyBeforeUpload = events.filter(event => event.type === 'newTranscriptReady').length;
+    await context.processVideoUpload({name: 'new.mp4'});
+    browse.onclick();
+    finishUpload(jsonResponse({status: 'complete', transcript: [{text: 'New uploaded transcript', start: 0}]}));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(context.state.currentTranscript[0].text, 'New uploaded transcript');
+    assert.equal(events.filter(event => event.type === 'newTranscriptReady').length, readyBeforeUpload + 1,
+        'Uploaded-video completion prompts for chapters/slides even after browsing in the background');
+    assert.equal(events.at(-1).detail.videoId, 'uploaded-new');
     console.log('PASS: reconnect to transcription progress without restarting the job');
 })().catch(error => {console.error(error); process.exitCode = 1;});

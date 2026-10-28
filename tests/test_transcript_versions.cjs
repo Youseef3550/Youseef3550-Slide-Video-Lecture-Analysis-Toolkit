@@ -22,7 +22,7 @@ const ids = {};
 for (const id of ['transcriptVersionSelect', 'captionTranscriptVersionSelect',
     'deleteTranscriptVersionBtn', 'transcriptVersionsControl', 'translationTarget']) ids[id] = element();
 const state = {currentVideoId: 'video', currentTranscriptSource: 'whisper'};
-const requests = [], errors = [];
+const requests = [], errors = [], events = [];
 const context = vm.createContext({
     state, showError: message => errors.push(message), showNotification() {},
     clearChapterMarkers() {}, updateChapters: chapters => { state.videoChapters = chapters; },
@@ -30,8 +30,9 @@ const context = vm.createContext({
     savedSummaryUrl: (id, language) => `/summary/${id}` + (language ? `?language=${language}` : ''),
     loadTranscript: transcript => { state.currentTranscript = transcript; },
     fetch: (url, options) => new Promise((resolve, reject) => requests.push({url, options, resolve, reject})),
-    document: {getElementById: id => ids[id], createElement: element, dispatchEvent() {}, addEventListener() {}},
-    CustomEvent: class {}, setTimeout() {}, clearTimeout() {},
+    document: {getElementById: id => ids[id], createElement: element,
+        dispatchEvent(event) { events.push(event.type); }, addEventListener() {}},
+    CustomEvent: class { constructor(type) { this.type = type; } }, setTimeout() {}, clearTimeout() {},
 });
 vm.runInContext(source, context);
 const originals = {id: 'original', kind: 'transcript', source: 'whisper', label: 'Original', active_whisper: true};
@@ -62,6 +63,8 @@ const reply = (request, data) => request.resolve({ok: true, json: async () => da
     assert.equal(state.videoChapters[0].title, 'Saved fallback chapter', 'Missing version chapters load the same saved fallback used by editors');
     assert.equal(state.currentTranslationLanguage, 'de');
     assert.equal(state.currentTranscript[0].text, 'Deutsch');
+    assert(events.includes('transcriptVersionSelected'));
+    assert.equal(state.whisperTranscriptPollGeneration, undefined, 'Switching versions must not stop background job polling');
     reply(requests.at(-1), {versions});
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(ids.captionTranscriptVersionSelect.value, 'de-version');

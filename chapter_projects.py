@@ -28,6 +28,7 @@ from project_paths import (
 )
 from slide_exports import slide_seconds
 from video_ranges import clip_timestamp, split_ranges
+from video_privacy import EFFECTS, privacy_regions, privacy_filter, video_dimensions, scan_people
 
 
 router = APIRouter()
@@ -37,6 +38,7 @@ _metadata_lock = threading.Lock()
 _tasks = set()
 _active_jobs = {}
 video_jobs = ExportJobStore(EXPORTS_DIR / "chapter-video-jobs")
+privacy_jobs = ExportJobStore(EXPORTS_DIR / "privacy-scan-jobs")
 
 
 async def extract_caption_tracks(video_path, project_id):
@@ -741,12 +743,60 @@ async def start_custom_video(video_id: str, request: Request):
         duration = await video_duration(source)
         if not math.isfinite(start) or not math.isfinite(end) or not 0 <= start < end <= duration:
             raise ValueError("Start must be before end, and both must be inside the video.")
+        regions = privacy_regions(data.get("privacy_regions", []), duration)
+        if regions and not any(region["start"] < end and region["end"] > start for region in regions):
+            raise ValueError("No privacy regions overlap this clip. Adjust their timing or turn masking off.")
         snapshot = {"video_path": source, "start": start, "end": end,
                     "caption_track_index": caption_index,
+                    "privacy_regions": regions,
                     "title": f"Clip_{data['start'].replace(':', '-')}_to_{data['end'].replace(':', '-')}"}
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise HTTPException(400, f"Could not prepare custom clip: {error}") from error
     return _start_video_download(video_id, snapshot)
+
+
+@router.post("/privacy_scans/{video_id}")
+async def start_privacy_scan(video_id: str, request: Request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("Privacy scan settings must be an object.")
+        source = _media_source(video_id, data)
+        duration = await video_duration(source)
+        start, end = clip_timestamp(data.get("start")), clip_timestamp(data.get("end"))
+        effect = data.get("effect", "blur")
+        if effect not in EFFECTS or not 0 <= start < end <= duration:
+            raise ValueError("Choose a valid privacy effect and a range inside the video.")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HTTPException(400, f"Could not prepare privacy scan: {error}") from error
+
+    async def generate(parent, options, step, artifacts, workspace):
+        regions = await scan_people(source, start, end, effect, step)
+        target = workspace / "privacy-regions.json"
+        target.write_text(json.dumps({"regions": regions}), encoding="utf-8")
+        return FileResponse(target)
+
+    return {"job_id": privacy_jobs.start(video_id, {"document_title": "People privacy scan"}, generate)}
+
+
+@router.get("/privacy_scan_jobs/{job_id}")
+def privacy_scan_status(job_id: str):
+    try:
+        state = privacy_jobs.read(job_id)
+        if state["status"] == "complete":
+            state["regions"] = json.loads(privacy_jobs.file(job_id, state["download_file"]).read_text(
+                encoding="utf-8"))["regions"]
+        return state
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(404, "Privacy scan not found.") from error
+
+
+@router.post("/privacy_scan_jobs/{job_id}/cancel")
+def cancel_privacy_scan(job_id: str):
+    try:
+        return privacy_jobs.cancel(job_id)
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(404, "Privacy scan not found.") from error
 
 
 @router.post("/audio_info/{video_id}")
@@ -822,10 +872,17 @@ async def _encode_video_download(snapshot, duration, target, step):
     if snapshot.get("retime_captions"):
         await encode_speed_video({**snapshot, "end": end, "speed": 1}, target, step)
         return
+    video_options = ["-map", "0:v:0"]
+    if snapshot.get("privacy_regions"):
+        width, height = await video_dimensions(snapshot["video_path"])
+        graph, output = privacy_filter(snapshot["privacy_regions"], width, height, start, end)
+        video_options = ["-filter_complex_threads", "1", "-filter_complex", graph,
+                         "-map", f"[{output}]"]
+        step("Applying reviewed privacy regions; audio and subtitle tracks are retained")
     command = [
         media_executable("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
         "-ss", str(start), "-i", str(snapshot["video_path"]), "-t", str(end - start),
-        "-map", "0:v:0", "-map", "0:a?",
+        *video_options, "-map", "0:a?",
         *([] if snapshot.get("omit_captions") else ["-map", "0:s?", "-c:s", "mov_text"]),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac",
         *([] if snapshot.get("omit_captions") else caption_disposition(snapshot)),

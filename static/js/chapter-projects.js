@@ -6,6 +6,7 @@ import { saveBlobToUserLocation, openOptionsDialog } from './utils.js';
 import { initCustomClipRange, clipTimestamp } from './custom-clip-range.js';
 import { selectedMediaExportId, selectedCaptionTrackIndex } from './caption-export.js';
 import { startProcessButton } from './progress-time.js';
+import { initClipPrivacy } from './clip-privacy.js';
 
 const storageKey = 'lectureseek-chapter-project-job';
 let pending = null;
@@ -343,8 +344,9 @@ export function initChapterProjects() {
     const clipEnd = document.getElementById('customClipEnd');
     const clipStatus = document.getElementById('customClipStatus');
     const player = document.querySelector('video');
+    const privacy = initClipPrivacy({state, player, mediaExportId: () => selectedMediaExportId(state.currentVideoId)});
     let clipRange = null;
-    clipDialog?.addEventListener('close', () => clipRange?.close());
+    clipDialog?.addEventListener('close', () => { clipRange?.close(); privacy.close(); });
     clipDialog?.addEventListener('keydown', event => {
         if (event.key === 'Escape') clipDialog.close();
     });
@@ -371,6 +373,7 @@ export function initChapterProjects() {
         clipVideoId = state.currentVideoId;
         if (!clipRange) clipRange = initCustomClipRange(player);
         clipRange.open();
+        privacy.open();
         clipStatus.textContent = '';
         openOptionsDialog(clipDialog);
     });
@@ -383,6 +386,9 @@ export function initChapterProjects() {
             return;
         }
         if (!clipRange.validate()) return;
+        let privacyRegions;
+        try { privacyRegions = privacy.settings(); }
+        catch (error) { clipStatus.textContent = error.message; return; }
         button.disabled = true;
         document.getElementById('customClipBtn').disabled = true;
         button.setAttribute('aria-busy', 'true');
@@ -393,6 +399,7 @@ export function initChapterProjects() {
                 start: clipStart.value.trim(), end: clipEnd.value.trim(),
                 media_export_id: selectedMediaExportId(clipVideoId),
                 caption_track_index: selectedCaptionTrackIndex(),
+                privacy_regions: privacyRegions,
             }, message => { clipStatus.textContent = message; }, button);
         } catch (error) {
             clipStatus.textContent = error.name === 'AbortError' ? 'Download cancelled.' : error.message;

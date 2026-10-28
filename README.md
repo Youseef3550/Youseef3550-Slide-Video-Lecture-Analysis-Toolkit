@@ -949,6 +949,27 @@ Home/End. The boundaries cannot cross or exceed the video duration. Closing the
 panel or switching videos removes the markers; invalid typed ranges cannot be
 downloaded. No permanent toolbar controls are added.
 
+**Privacy masking:** Expand **Privacy / hide regions** in the custom clip panel.
+Draw a rectangle on the video preview, add an adjustable box, or choose an
+existing detected region in the current slide. Each region supports **Blur**
+(default), **Pixelate**, or **Solid black cover**, editable percentage coordinates,
+and timing for just that slide/scene or the entire exported clip.
+**Find people in clip** scans the selected video source locally every 0.5 seconds,
+with progress and a Stop button. First use downloads YOLO11n model weights into
+`~/.cache/lectureseek`; video frames are not uploaded. Automatic candidates
+start with detected-interval timing; they can be adjusted, extended to the
+entire export, or removed before downloading. Up to 64 regions are supported.
+Masks apply only to the exported MP4; the original video is never changed.
+Use **Video start** and **Video end** to mask a whole-video download.
+
+Automatic detection can miss moving people, small webcam tiles, and faces.
+Review the entire exported video before sharing. Blur and pixelation are not
+guaranteed anonymization; use a solid cover for stronger visual concealment.
+Audio, soft subtitles, and already burned-in captions outside the masked regions
+are retained and can still identify people. The preview is illustrative; the
+export uses FFmpeg masking, rounds region boundaries outward to video pixel
+boundaries, and requires regions at least two source pixels wide and high.
+
 **Webpage section screenshots:** Sections with detected slides retain those slide
 images. Sections without slides capture a frame at their own exported start
 timestamp instead of repeating the parent chapter screenshot. The enlarged

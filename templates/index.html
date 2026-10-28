@@ -1189,6 +1189,30 @@
                 <button id="customClipVideoEndBtn" class="btn btn-secondary" type="button" title="Set clip end to the full video duration">Video end</button>
             </div>
             <small>Marker keys: arrows = 1 second, Shift = 10 seconds, Alt = 0.1 seconds.</small>
+            <details id="clipPrivacyOptions">
+                <summary>Privacy / hide regions</summary>
+                <label><input id="clipPrivacyEnabled" type="checkbox"> Apply privacy masks to this download</label>
+                <p>Draw a box on the preview, choose an existing detected region, or scan for people.
+                    Detection samples every 0.5 seconds and can miss faces, moving people or webcam tiles.
+                    Review the entire output before sharing. Blur/pixelation are not guaranteed anonymization.
+                    Audio and subtitles are kept and may still identify people.
+                    Scanning runs locally; first use downloads the people-detection model, not your video.</p>
+                <label for="clipPrivacyEffect">New region appearance</label>
+                <select id="clipPrivacyEffect">
+                    <option value="blur">Blur</option>
+                    <option value="pixelate">Pixelate</option>
+                    <option value="cover">Solid black cover</option>
+                </select>
+                <div class="row-actions">
+                    <select id="clipPrivacyDetection" aria-label="Detected region in the current slide"></select>
+                    <button id="clipPrivacyAddDetection" class="btn btn-secondary" type="button">Add detected region</button>
+                    <button id="clipPrivacyAddManual" class="btn btn-secondary" type="button">Add adjustable box</button>
+                    <button id="clipPrivacyScan" class="btn btn-secondary" type="button">Find people in clip</button>
+                </div>
+                <canvas id="clipPrivacyPreview" class="clip-privacy-preview" aria-label="Privacy preview. Drag to add a box, or use Add adjustable box and edit its coordinates."></canvas>
+                <p id="clipPrivacyStatus" role="status" aria-live="polite"></p>
+                <div id="clipPrivacyRegions"></div>
+            </details>
             <p id="customClipStatus" role="status" aria-live="polite"></p>
             <button id="downloadCustomClipBtn" class="btn btn-accent" type="submit">Download clip</button>
             <button id="closeCustomClipBtn" class="btn btn-secondary" type="button">Close</button>

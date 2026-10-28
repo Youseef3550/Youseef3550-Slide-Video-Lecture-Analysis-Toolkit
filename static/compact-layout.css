@@ -1347,3 +1347,48 @@ progress {
     border-radius: 0;
     font: inherit;
 }
+
+.clip-privacy-preview {
+    display: block;
+    width: 100%;
+    height: auto;
+    margin-block: 8px;
+    touch-action: none;
+    cursor: crosshair;
+    border: 1px solid var(--border-strong, #888);
+}
+
+#clipPrivacyOptions {
+    margin-block: 10px;
+}
+
+#clipPrivacyOptions p {
+    font-size: 12px;
+}
+
+#clipPrivacyOptions .row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+#clipPrivacyRegions {
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+#clipPrivacyRegions details {
+    padding: 6px;
+    border-bottom: 1px solid var(--border, #ccc);
+}
+
+#clipPrivacyRegions label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: 4px;
+}
+
+#clipPrivacyRegions input {
+    width: 70px;
+}

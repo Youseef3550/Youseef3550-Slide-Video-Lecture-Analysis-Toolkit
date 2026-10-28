@@ -38,6 +38,7 @@ function element() {
     const context = vm.createContext({
         startProcessButton: require('./process_button_stub.cjs'),
         state,
+        initClipPrivacy: () => ({open() {}, close() {}, settings: () => []}),
         setTimeout(callback, delay) {
             if (delay !== 4000) return setTimeout(callback, delay);
             successTimers.set(++timerId, callback);

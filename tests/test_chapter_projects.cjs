@@ -28,6 +28,7 @@ function fixture() {
     const context = vm.createContext({
         startProcessButton: require('./process_button_stub.cjs'),
         state,
+        initClipPrivacy: () => ({open() {}, close() {}, settings: () => []}),
         contentLanguage: (_, __, language) => language || '',
         selectedMediaExportId: () => 'caption-copy',
         selectedCaptionTrackIndex: () => 1,

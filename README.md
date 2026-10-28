@@ -989,7 +989,7 @@ and recorded separately so Undo does not combine chapters with background transc
 When a newly generated or uploaded transcript becomes ready, a compact prompt
 offers **Chapters**, **Slides**, **Both**, or **Not now**. Nothing starts by
 default; **Both** starts the independent jobs together using their current options.
-**Remember my choice** applies to future new transcripts in this browser.
+**Always do this when I upload new videos** remembers the choice for future new transcripts in this browser.
 Change or reset it under **Settings > When a new transcript is ready**.
 Reopening saved projects, changing transcript versions or labeling speakers does
 not trigger the prompt. Remembered automatic choices do not replace existing

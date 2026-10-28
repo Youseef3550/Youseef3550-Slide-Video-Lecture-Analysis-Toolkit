@@ -236,6 +236,14 @@ class TranscriptProcessor:
                 "error": f"Unsupported speaker mode: {speaker_mode}",
             })
         if speakers_only:
+            progress = TRANSCRIPTS_DIR / f"{video_id}_whisper_progress.txt"
+            if progress.is_file() and time.time() - progress.stat().st_mtime <= self.progress_stale_seconds:
+                return JSONResponse({
+                    "success": True, "status": "in_progress",
+                    "phase": "identifying_speakers",
+                    "message": "Transcript processing is already running. Showing its progress.",
+                    "status_url": f"/whisper_transcript_status/{video_id}",
+                })
             if not (TRANSCRIPTS_DIR / f"{video_id}_whisper.json").is_file():
                 return JSONResponse({
                     "success": False,

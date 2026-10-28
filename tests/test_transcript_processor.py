@@ -39,6 +39,20 @@ from processors.transcript_processor import TranscriptProcessor
 
 
 class TranscriptProcessorReuseTests(unittest.TestCase):
+    def test_speaker_click_reconnects_to_running_job_when_transcript_is_backed_up(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)), \
+                mock.patch.object(TranscriptProcessor, "_terminate_whisper_process") as terminate:
+            root = Path(directory)
+            (root / "vid_whisper_before_speakers.json").write_text('[{"start":0,"text":"Existing"}]')
+            (root / "vid_whisper_progress.txt").write_text("100")
+            response = asyncio.run(TranscriptProcessor().generate_whisper_transcript(
+                "vid", mock.Mock(), speakers_only=True, force=True))
+            self.assertTrue(response.content["success"])
+            self.assertEqual(response.content["status"], "in_progress")
+            terminate.assert_not_called()
+            self.assertTrue((root / "vid_whisper_before_speakers.json").exists())
+
     def test_cancel_restores_previous_transcript_and_clears_progress(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(transcript_module, "TRANSCRIPTS_DIR", Path(directory)), \

@@ -106,5 +106,6 @@ const click = action => buttons.find(button => button.dataset.readyAction === ac
     const template = fs.readFileSync(path.join(__dirname, '..', 'templates', 'index.html'), 'utf8');
     for (const action of ['chapters', 'slides', 'both', 'none']) assert(template.includes(`data-ready-action="${action}"`));
     assert(template.includes('id="transcriptReadyAction"'), 'Settings can reset a remembered choice');
+    assert(template.includes('Always do this when I upload new videos'));
     console.log('PASS: new transcript prompt, parallel actions, remembered choices, deduplication and project guards');
 })().catch(error => { console.error(error); process.exitCode = 1; });

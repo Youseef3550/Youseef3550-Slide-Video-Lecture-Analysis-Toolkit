@@ -49,6 +49,7 @@ class GenerateRequest(BaseModel):
 
 class SubmitRequest(BaseModel):
     answers: dict[str, str]
+    student_name: str = "Student"
 
 
 def _check_video_id(video_id):
@@ -214,8 +215,7 @@ def _grade(question, answer):
         result["correct_answer"] = correct
         result["score"] = 1.0 if is_correct else 0.0
         result["is_correct"] = is_correct
-        prefix = "Correct. " if is_correct else f"Not quite. The answer is {correct}. "
-        result["feedback"] = prefix + question.get("explanation", "")
+        result["feedback"] = "Correct." if is_correct else f"Wrong. The answer is {correct}."
         return result
 
     if qtype == "fill_in_blank":
@@ -224,13 +224,13 @@ def _grade(question, answer):
         if not answer:
             score, feedback = 0.0, f"No answer was written. The answer is {question['correct_answer']}."
         elif answer.lower() in accepted:
-            score, feedback = 1.0, "Correct. " + question.get("explanation", "")
+            score, feedback = 1.0, "Correct."
         else:
             score, feedback = _judge_fill(question, answer)
             if score is None:
                 result["feedback"] = feedback
                 return result
-            feedback = feedback or f"The answer is {question['correct_answer']}. " + question.get("explanation", "")
+            feedback = (feedback or "").split(". ")[0][:160] or f"The answer is {question['correct_answer']}."
         result["score"] = score
         result["is_correct"] = score >= PASS_THRESHOLD
         result["feedback"] = feedback
@@ -280,7 +280,7 @@ def _overall_feedback(quiz, results, percentage, grade, weak):
         "Rules:\n"
         "- Start with the actual result. Do not praise more than the result justifies.\n"
         "- Praise only if the score is 80% or higher. Below 60%, be direct and say clearly what went wrong.\n"
-        "- Name up to 3 wrong questions and the specific misunderstanding behind each, one sentence each.\n"
+        "- Keep the overall text to one or two short sentences. Put the detail of each wrong answer in the recommendations.\n"
         "- Then give up to 5 study recommendations, each with a topic, the lecture timestamp (MM:SS) to review, "
         "and a short reason.\n"
         "- Do not invent facts that are not in the questions above.\n"
@@ -337,12 +337,13 @@ def generate(req: GenerateRequest):
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"AI provider error: {error}")
 
+    quiz["published"] = False
     save_quiz(BASE_DIR, req.video_id, quiz)
     return student_view(quiz)
 
 
 @router.get("/list")
-def list_quizzes(video_id: str):
+def list_quizzes(video_id: str, role: str = "instructor"):
     """Saved quizzes for one video, newest first."""
     _check_video_id(video_id)
     folder = _quiz_folder(video_id)
@@ -351,8 +352,12 @@ def list_quizzes(video_id: str):
     items = []
     for path in sorted(folder.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         quiz = json.loads(path.read_text(encoding="utf-8"))
+        published = quiz.get("published", True)
+        if role == "student" and not published:
+            continue
         items.append({
             "quiz_id": quiz["quiz_id"],
+            "published": published,
             "title": quiz["scope"]["title"],
             "difficulty": quiz["config"]["difficulty"],
             "bloom": quiz["config"].get("bloom"),
@@ -389,26 +394,42 @@ def student_progress(video_id: str):
 
 
 @router.get("/{quiz_id}")
-def get_quiz(quiz_id: str, video_id: str):
+def get_quiz(quiz_id: str, video_id: str, role: str = "instructor"):
     """The quiz for a student to answer. Answers are not included."""
-    return student_view(_load_full_quiz(video_id, quiz_id))
+    quiz = _load_full_quiz(video_id, quiz_id)
+    if role == "student" and not quiz.get("published", True):
+        raise HTTPException(status_code=404, detail="This quiz is not published yet")
+    return student_view(quiz)
 
 
 @router.post("/{quiz_id}/submit")
-def submit_quiz(quiz_id: str, video_id: str, body: SubmitRequest):
+def submit_quiz(quiz_id: str, video_id: str, body: SubmitRequest, role: str = "instructor"):
     """Grade the answers, save the attempt, and return feedback, weak chapters and recommendations."""
     quiz = _load_full_quiz(video_id, quiz_id)
+    if role == "student" and not quiz.get("published", True):
+        raise HTTPException(status_code=403, detail="This quiz is not published yet")
     results = [_grade(q, body.answers.get(q["id"], "").strip()) for q in quiz["questions"]]
 
     graded = [r["score"] for r in results if r["score"] is not None]
     percentage = round(100 * sum(graded) / len(graded), 1) if graded else 0.0
     grade = _letter(percentage) if graded else None
-    weak = _weak_chapters({"results": results}, _load_chapters(video_id))
+    chapters = _load_chapters(video_id)
+    for result in results:
+        index = _chapter_for(parse_timestamp(result["source"]["timestamp"]), chapters)
+        if index is not None:
+            result["review"] = {
+                "chapter_index": index,
+                "title": chapters[index]["title"],
+                "timestamp": chapters[index]["timestamp"],
+            }
+    weak = _weak_chapters({"results": results}, chapters)
     overall, recommendations = _overall_feedback(quiz, results, percentage, grade, weak)
 
+    name = (body.student_name or "").strip()[:60] or "Student"
     attempt = {
         "attempt_id": str(uuid.uuid4()),
         "quiz_id": quiz_id,
+        "student_name": name,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "score": {"percentage": percentage, "grade": grade, "graded": len(graded), "total": len(results)},
         "overall_feedback": overall,
@@ -426,12 +447,15 @@ def submit_quiz(quiz_id: str, video_id: str, body: SubmitRequest):
 
 
 @router.get("/{quiz_id}/attempts")
-def list_attempts(quiz_id: str, video_id: str):
-    """Every attempt for this quiz, oldest first."""
+def list_attempts(quiz_id: str, video_id: str, role: str = "instructor"):
+    """Every attempt for this quiz, oldest first. Instructors only."""
+    if role != "instructor":
+        raise HTTPException(status_code=403, detail="Only instructors can see the attempts")
     _load_full_quiz(video_id, quiz_id)
     return [
         {
             "attempt_id": data["attempt_id"],
+            "student_name": data.get("student_name", "Student"),
             "submitted_at": data["submitted_at"],
             "percentage": data["score"]["percentage"],
             "grade": data["score"].get("grade"),
@@ -469,10 +493,24 @@ def quiz_summary(quiz_id: str, video_id: str):
 
 
 @router.delete("/{quiz_id}")
-def delete_quiz(quiz_id: str, video_id: str):
-    """Delete a quiz and its attempts."""
+def delete_quiz(quiz_id: str, video_id: str, role: str = "instructor"):
+    """Delete a quiz and its attempts. Instructors only."""
+    if role != "instructor":
+        raise HTTPException(status_code=403, detail="Only instructors can delete quizzes")
     _load_full_quiz(video_id, quiz_id)
     (_quiz_folder(video_id) / f"{quiz_id}.json").unlink()
     for path, _ in _attempt_files(video_id, quiz_id):
         path.unlink()
     return {"deleted": quiz_id}
+
+
+@router.post("/{quiz_id}/publish")
+def publish_quiz(quiz_id: str, video_id: str, publish: bool = True, role: str = "instructor"):
+    """Make a quiz visible to students, or hide it again as a draft. Instructors only."""
+    if role != "instructor":
+        raise HTTPException(status_code=403, detail="Only instructors can publish quizzes")
+    quiz = _load_full_quiz(video_id, quiz_id)
+    quiz["published"] = bool(publish)
+    path = _quiz_folder(video_id) / f"{quiz_id}.json"
+    path.write_text(json.dumps(quiz, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"quiz_id": quiz_id, "published": quiz["published"]}

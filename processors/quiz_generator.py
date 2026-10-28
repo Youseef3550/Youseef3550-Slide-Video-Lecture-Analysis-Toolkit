@@ -122,14 +122,15 @@ def load_slides(base_dir, video_id):
     for scene in scenes if isinstance(scenes, list) else []:
         if not isinstance(scene, dict):
             continue
-        yolo = scene.get("yolo_detections") or {}
-        if not yolo.get("success"):
-            continue
-        texts = [str(d.get("ocr_text", "")).strip()
-                 for d in yolo.get("detections", []) if isinstance(d, dict)]
-        texts = [t for t in texts if t]
-        if texts:
-            slides.append((float(scene.get("time_seconds", 0) or 0), " ".join(texts)))
+        text = str(scene.get("slide_text") or "").strip()
+        if not text:
+            yolo = scene.get("yolo_detections") or {}
+            if yolo.get("success"):
+                texts = [str(d.get("ocr_text", "")).strip()
+                         for d in yolo.get("detections", []) if isinstance(d, dict)]
+                text = " ".join(t for t in texts if t)
+        if text:
+            slides.append((float(scene.get("time_seconds", 0) or 0), text))
     return slides
 
 
@@ -481,7 +482,9 @@ def generate_quiz(
     if not accepted:
         raise RuntimeError(f"No valid questions after {rounds_total} round(s)")
 
-    accepted = _balance_true_false(accepted[:count])
+    # Keep every question that passed the checks, up to the count. Dropping True/False
+    # questions here is what made 6 requested questions come back as 5.
+    accepted = accepted[:count]
     for number, item in enumerate(accepted, start=1):
         item["id"] = f"q{number}"
 

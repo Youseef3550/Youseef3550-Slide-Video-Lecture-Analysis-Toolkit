@@ -346,5 +346,59 @@ class NewFeatureTests(unittest.TestCase):
             shutil.rmtree(routes_base, ignore_errors=True)
 
 
+from fastapi import HTTPException
+
+class PublishTests(unittest.TestCase):
+
+    def test_students_only_see_published_quizzes(self):
+        base = Path(tempfile.mkdtemp())
+        try:
+            folder = base / "static" / "quizzes" / VIDEO_ID
+            folder.mkdir(parents=True)
+            quiz_id = "22222222-3333-4444-5555-666666666666"
+            (folder / f"{quiz_id}.json").write_text(json.dumps({
+                "quiz_id": quiz_id, "scope": {"title": "Queue"},
+                "config": {"difficulty": "easy", "bloom": "remember"},
+                "questions": [], "metadata": {"created_at": "2026-10-27T10:00:00+00:00"},
+                "published": False}))
+            with mock.patch.object(quiz_routes, "BASE_DIR", base):
+                self.assertEqual(quiz_routes.list_quizzes(VIDEO_ID, role="student"), [])
+                self.assertEqual(len(quiz_routes.list_quizzes(VIDEO_ID, role="instructor")), 1)
+                with self.assertRaises(HTTPException):
+                    quiz_routes.get_quiz(quiz_id, VIDEO_ID, role="student")
+                quiz_routes.publish_quiz(quiz_id, VIDEO_ID, publish=True, role="instructor")
+                self.assertEqual(len(quiz_routes.list_quizzes(VIDEO_ID, role="student")), 1)
+                with self.assertRaises(HTTPException):
+                    quiz_routes.publish_quiz(quiz_id, VIDEO_ID, publish=False, role="student")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+class AttemptNameTests(unittest.TestCase):
+
+    def test_attempts_keep_the_student_name_and_hide_from_students(self):
+        base = Path(tempfile.mkdtemp())
+        try:
+            folder = base / "static" / "quizzes" / VIDEO_ID
+            folder.mkdir(parents=True)
+            quiz_id = "33333333-4444-5555-6666-777777777777"
+            (folder / f"{quiz_id}.json").write_text(json.dumps({
+                "quiz_id": quiz_id, "scope": {"title": "Queue"}, "published": True,
+                "questions": [{"id": "q1", "type": "mcq", "question": "Q?", "options": [],
+                               "correct_answer": "A", "explanation": "x", "source": {"timestamp": "01:00"}}],
+            }))
+            body = quiz_routes.SubmitRequest(answers={"q1": "A"}, student_name="  Huda  ")
+            with mock.patch.object(quiz_routes, "BASE_DIR", base), \
+                 mock.patch("quiz_routes.call_gemini", side_effect=RuntimeError("offline")):
+                attempt = quiz_routes.submit_quiz(quiz_id, VIDEO_ID, body, role="student")
+                self.assertEqual(attempt["student_name"], "Huda")
+                rows = quiz_routes.list_attempts(quiz_id, VIDEO_ID, role="instructor")
+                self.assertEqual(rows[0]["student_name"], "Huda")
+                with self.assertRaises(HTTPException):
+                    quiz_routes.list_attempts(quiz_id, VIDEO_ID, role="student")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

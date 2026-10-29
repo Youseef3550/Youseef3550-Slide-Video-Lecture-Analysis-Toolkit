@@ -5,9 +5,10 @@ import { state } from './main.js';
 import { updateTimelineHighlight, updateChapterCaptions } from './video.js';
 import { fetchOcrResults } from './ocr.js';
 import { showError } from './ui.js';
-import { saveBlobToUserLocation } from './utils.js';
-import { createSlideDownloadButton, setupSlideTextDownload } from './slide-downloads.js';
-import { startElapsedTimer } from './progress-time.js';
+import { saveBlobToUserLocation, datedExportFilename } from './utils.js';
+import { createSlideDownloadButton, setupSlideTextDownload, screenshotArchiveFilename } from './slide-downloads.js';
+import { startElapsedTimer, startProcessButton, finishProcessButton } from './progress-time.js';
+import { createSlideVideoDownloadButton } from './chapter-projects.js';
 
 // Add state variable for label visibility
 let labelsVisible = true;
@@ -132,6 +133,7 @@ export async function checkSceneDetection(videoId) {
                 if (elements.downloadScreenshotsBtn) {
                     elements.downloadScreenshotsBtn.disabled = data.scenes.length === 0;
                 }
+                finishProcessButton(elements.detectScenesBtn);
                 elements.detectScenesBtn.disabled = false;
                 elements.detectScenesBtn.innerHTML = '<i class="fas fa-film"></i> Detect Slides';
                 
@@ -148,6 +150,7 @@ export async function checkSceneDetection(videoId) {
                 startElapsedTimer(elements.scenesContainer, elapsed);
                 elements.thumbnailTimeline.innerHTML = '<p>Generating visual timeline...</p>';
                 startElapsedTimer(elements.thumbnailTimeline, elapsed);
+                startProcessButton(elements.detectScenesBtn, 'Detecting slides', {elapsedSeconds: elapsed});
             }
 
         } else {
@@ -161,6 +164,7 @@ export async function checkSceneDetection(videoId) {
         }
         elements.scenesContainer.innerHTML = `<p>Scene processing failed: ${error.message}</p><p>Please check the server log and try again.</p>`;
         elements.thumbnailTimeline.textContent = 'Slide detection stopped.';
+        finishProcessButton(elements.detectScenesBtn);
         elements.detectScenesBtn.disabled = false;
         elements.detectScenesBtn.innerHTML = '<i class="fas fa-film"></i> Detect Slides';
         showError(`Error checking scene detection: ${error.message}`);
@@ -178,13 +182,16 @@ export async function downloadSceneScreenshots() {
     button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Preparing...';
     const stopElapsed = startElapsedTimer(button);
     try {
+        const filename = screenshotArchiveFilename();
         const response = await fetch(`/download_scene_screenshots/${encodeURIComponent(state.currentVideoId)}`);
         if (!response.ok) {
             const error = await response.json().catch(() => ({}));
             throw new Error(error.detail || 'Could not download slide screenshots');
         }
         const blob = await response.blob();
-        await saveBlobToUserLocation(blob, `${state.currentVideoId}_slide_screenshots.zip`);
+        const disposition = response.headers?.get('content-disposition') || '';
+        const match = disposition.match(/filename="?([^";]+)"?/i);
+        await saveBlobToUserLocation(blob, match ? match[1] : filename);
     } catch (error) {
         showError(`Error downloading screenshots: ${error.message}`);
     } finally {
@@ -292,11 +299,12 @@ export function updateScenes(scenes, videoPlayer) {
         div.dataset.time = scene.time_seconds;
         div.innerHTML = `
             <span class="scene-timestamp">${scene.timestamp}</span>
-            <span class="scene-label">Scene ${index + 1}</span>
+            <span class="scene-label">${index + 1}</span>
         `;
         div.querySelector('.scene-label').dataset.number = index + 1;
         div.appendChild(createSlideDownloadButton([index], `Download slide ${index + 1}`));
-        div.onclick = () => {
+        div.onclick = (event) => {
+            if (div.closest('.is-inline-editing') || event.target.closest('input, textarea, button')) return;
             videoPlayer.currentTime = scene.time_seconds;
         };
         scenesContainer.appendChild(div);
@@ -351,9 +359,11 @@ export function updateScenes(scenes, videoPlayer) {
             timelineItem.appendChild(img);
             timelineItem.appendChild(timestamp);
             timelineItem.appendChild(createSlideDownloadButton([index], `Download slide ${index + 1}`));
+            timelineItem.appendChild(createSlideVideoDownloadButton(scene, index, scenes, videoPlayer));
             
             // Set click handler for seeking
-            timelineItem.onclick = () => {
+            timelineItem.onclick = (event) => {
+                if (event.target.closest('button, input, a')) return;
                 videoPlayer.currentTime = scene.time_seconds;
             };
             
@@ -1459,7 +1469,7 @@ function extractElement(element, className) {
     
     // Create a download link
     const link = document.createElement('a');
-    link.download = `extracted_${className}_${new Date().getTime()}.png`;
+    link.download = datedExportFilename(`extracted_${className}_${new Date().getTime()}.png`);
     link.href = canvas.toDataURL('image/png');
     link.click();
 }

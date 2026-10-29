@@ -19,63 +19,49 @@ export function extractVideoId(url) {
 }
 
 /**
- * Formats seconds into MM:SS format
+ * Formats seconds into MM:SS, or H:MM:SS from one hour onward.
  * @param {number} seconds - The time in seconds
  * @returns {string} - Formatted time string
  */
 export function formatTime(seconds) {
-    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor(seconds / 60) % 60;
     const secs = Math.floor(seconds % 60);
-    return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    const clock = `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    return hours ? `${hours}:${clock}` : clock;
+}
+
+export function formatTimestamp(timestamp) {
+    const value = String(timestamp);
+    const seconds = value.split(':').reduce((total, part) => total * 60 + Number(part), 0);
+    const fraction = value.match(/\.\d+$/)?.[0] || '';
+    return formatTime(Math.floor(seconds)) + fraction;
 }
 
 /**
- * Saves a generated file using the browser's location picker when available.
- * Browsers without the File System Access API fall back to their normal download flow.
+ * Sends a generated file through one browser download flow.
+ * Browser download settings control whether to prompt for a location.
  */
-export async function saveBlobToUserLocation(blob, filename, container = document.body) {
-    const picker = window.showSaveFilePicker;
-    if (typeof picker === 'function') {
-        const extension = filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';
-        const mimeTypes = {
-            zip: 'application/zip',
-            docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            pdf: 'application/pdf',
-            mp4: 'video/mp4',
-        };
-        try {
-            const handle = await picker({
-                suggestedName: filename,
-                types: extension && mimeTypes[extension]
-                    ? [{ description: extension.toUpperCase(), accept: { [mimeTypes[extension]]: [`.${extension}`] } }]
-                    : undefined,
-            });
-            const writable = await handle.createWritable();
-            await writable.write(blob);
-            await writable.close();
-            return;
-        } catch (error) {
-            const isGestureError = (
-                error instanceof DOMException
-                && (error.name === 'NotAllowedError' || error.name === 'SecurityError')
-            ) || (
-                error instanceof Error
-                && /showSaveFilePicker|user gesture/i.test(error.message)
-            );
-            if (!isGestureError) {
-                throw error;
-            }
-            console.warn('Save picker was unavailable outside a user gesture; using browser download.', error);
-        }
-    }
+export function datedExportFilename(filename, date = new Date()) {
+    const dot = filename.lastIndexOf('.');
+    const stem = dot > 0 ? filename.slice(0, dot) : filename;
+    const extension = dot > 0 ? filename.slice(dot) : '';
+    if (/_\d{4}-\d{2}-\d{2}$/.test(stem)) return filename;
+    const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    return `${stem}_${day}${extension}`;
+}
 
+export async function saveBlobToUserLocation(blob, filename, container = document.body) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = filename;
+    link.download = datedExportFilename(filename);
     link.style.display = 'none';
     container.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    try {
+        link.click();
+    } finally {
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
 }

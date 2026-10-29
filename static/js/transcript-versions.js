@@ -4,6 +4,7 @@ import { state } from './main.js';
 import { loadTranscript } from './transcript.js';
 import { updateChapters, clearChapterMarkers } from './chapters.js';
 import { showError, showNotification } from './ui.js';
+import { contentLanguage, savedSummaryUrl } from './content-languages.js';
 
 let versions = [];
 let refreshGeneration = 0;
@@ -54,7 +55,8 @@ function render() {
     if (!selected) {
         const placeholder = document.createElement('option');
         placeholder.value = '';
-        placeholder.textContent = state.currentTranscriptSource === 'youtube'
+        placeholder.textContent = state.currentVideoId && state.currentTranscript?.length
+            && state.currentTranscriptSource === 'youtube'
             ? 'YouTube captions (current)' : 'Saved transcripts…';
         element.append(placeholder);
     }
@@ -124,8 +126,9 @@ function showNoChapters() {
 
 async function loadOriginalChapters(videoId) {
     try {
-        const response = await fetch(`/summary/${encodeURIComponent(videoId)}`);
+        const response = await fetch(savedSummaryUrl(videoId, state.currentTranslationLanguage));
         const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || 'Could not read saved chapters.');
         if (videoId !== state.currentVideoId) return;
         if (data.success && data.exists && Array.isArray(data.chapters) && data.chapters.length) {
             state.videoChapters = data.chapters;
@@ -134,7 +137,7 @@ async function loadOriginalChapters(videoId) {
             showNoChapters();
         }
     } catch (error) {
-        console.warn('Could not reload chapters:', error);
+        if (videoId === state.currentVideoId) showError(`Could not reload chapters: ${error.message}`);
     }
 }
 
@@ -155,7 +158,7 @@ export async function chooseTranscriptVersion(versionId) {
         if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
         if (videoId !== state.currentVideoId) return;
         const version = data.version;
-        state.whisperTranscriptPollGeneration = (state.whisperTranscriptPollGeneration || 0) + 1;
+        document.dispatchEvent(new CustomEvent('transcriptVersionSelected'));
         state.currentTranscriptVersionId = version.id;
         const targetSelect = document.getElementById('translationTarget');
         if (version.kind === 'translation') {
@@ -168,13 +171,12 @@ export async function chooseTranscriptVersion(versionId) {
             if (targetSelect) targetSelect.value = '';
         }
         loadTranscript(data.transcript);
-        if (version.kind === 'translation' && Array.isArray(data.chapters) && data.chapters.length) {
+        if (contentLanguage(videoId, 'chapters', state.currentTranslationLanguage) !== (state.currentTranslationLanguage || '')
+                || !Array.isArray(data.chapters) || !data.chapters.length) {
+            await loadOriginalChapters(videoId);
+        } else if (Array.isArray(data.chapters)) {
             state.videoChapters = data.chapters;
             updateChapters(data.chapters);
-        } else if (version.kind === 'translation') {
-            showNoChapters();
-        } else {
-            await loadOriginalChapters(videoId);
         }
         showNotification(`Switched to: ${version.label}`, 'success');
     } catch (error) {
@@ -225,5 +227,10 @@ export function initTranscriptVersions() {
     document.addEventListener('transcriptUpdated', () => {
         if (!switching) state.currentTranscriptVersionId = null;
         scheduleRefresh();
+    });
+    document.addEventListener('videoSelectionChanged', () => {
+        ++refreshGeneration;
+        versions = [];
+        render();
     });
 }

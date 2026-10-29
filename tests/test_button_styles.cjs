@@ -36,6 +36,40 @@ for (const [, attributes] of html.matchAll(/<dialog\b([^>]*)>/g)) {
     }
 }
 const layout = fs.readFileSync(path.join(root, 'static', 'compact-layout.css'), 'utf8');
+const theme = fs.readFileSync(path.join(root, 'static', 'theme.css'), 'utf8');
+const rule = selector => {
+    const start = theme.indexOf(`${selector} {`);
+    assert(start >= 0, `${selector} must have a shared style`);
+    return theme.slice(start, theme.indexOf('}', start) + 1);
+};
+const menuRows = rule('.action-menu > .row-actions-content > .btn');
+for (const declaration of ['width: 100%', 'min-height: 28px', 'padding: 4px 8px',
+    'justify-content: flex-start', 'text-align: start', 'background: transparent',
+    'box-shadow: none', 'white-space: normal']) assert(menuRows.includes(declaration), declaration);
+assert(rule('.action-menu > .row-actions-content > .btn:focus-visible').includes('outline: 2px'),
+    'Compact menu rows keep keyboard focus visible');
+assert(rule('.action-menu > .row-actions-content > .btn-danger').includes('var(--err-fg)'));
+assert(rule('.controls-bar > .action-menu > .row-actions-content').includes('position: absolute'),
+    'Opening toolbar menus must not push chapter/transcript content down');
+assert(rule('.controls-bar > .action-menu > .row-actions-content').includes('overflow-y: auto'));
+assert(!theme.includes('box-shadow: inset 3px 0 0'), 'Secondary actions must not compete with primary actions');
+assert(rule('.btn.btn-options').includes('background-color: var(--surface-1)'));
+for (const token of ['--running-fg:', '--running-bg:', '--running-accent:']) {
+    assert.equal(theme.split(token).length - 1, 2, `${token} must support both light and dark themes`);
+}
+for (const selector of [
+    '.btn:is([aria-busy="true"], :has(.fa-spinner.fa-spin), :has(> .progress-elapsed.is-running))',
+    '#videoSummaryStatus > .progress-elapsed.is-running',
+    '#transcriptContainer > .progress-elapsed.is-running',
+    '#regenerateTranscriptAction',
+    '#translationProgressText',
+    '#captionVideoProgress > .progress-elapsed.is-running',
+    '.ocr-progress-container:is([data-status="queued"], [data-status="running"], [data-status="stopping"])',
+]) {
+    assert(theme.includes(selector), `${selector} must share the active-work highlight`);
+}
+assert(theme.includes('accent-color: var(--running-accent)'), 'Native progress indicators share the active color');
+assert(layout.includes('padding: 4px 8px'), 'Shared buttons keep a compact hit target');
 assert(layout.includes('--popup-width: var(--panel-width, 420px)'), 'Desktop popups must match the panel, not widen across the video');
 assert(layout.includes('--popup-top: min(var(--panel-top, 12px)'), 'Narrow-screen popups must share a viewport-clamped panel position');
 for (const selector of ['html .options-dialog', 'html .modal-content', 'html .debug-content', 'html .config-dialog-content']) {
@@ -58,7 +92,7 @@ assert(captionDialog.includes('id="captionTranscriptLabel" hidden'), 'Do not rep
 assert(!captionDialog.match(/<details[^>]*\bopen\b/), 'Caption explanations should be collapsed by default');
 assert(captionDialog.includes('> Enlarge preview</button>'), 'Keep preview action concise');
 assert(transcriptOptions.includes('<summary>Advanced transcription options</summary>'));
-assert(dialog('sceneDetectionOptionsDialog').includes('<summary>Detection help</summary>'));
+assert(dialog('sceneDetectionOptionsDialog').includes('<summary>? Method help</summary>'));
 assert(html.includes('<summary>Chapter help</summary>'));
 assert(html.includes('<summary>Device help</summary>'));
 assert(dialog('captionStyleDialog').includes('id="captionTranscriptVersionSelect"'));
@@ -82,8 +116,8 @@ const dynamicControls = [
     ['scenes.js', "reloadBtn.className = 'btn btn-secondary btn-action detection-toggle-btn'"],
     ['interactive-layer.js', 'id="extractAllBtn" class="btn btn-secondary btn-action"'],
     ['interactive-layer.js', 'id="autoExtractConfigBtn" class="btn btn-secondary btn-options"'],
-    ['api-module.js', 'id="stopTranscriptionBtn" type="button" class="btn btn-danger"'],
-    ['ocr.js', 'id="stopOcrBtn" class="btn btn-danger"'],
+    ['api-module.js', 'const process = startProcessButton(button,'],
+    ['ocr.js', 'id="stopOcrBtn" class="btn btn-secondary"'],
     ['ui.js', "actionButton.className = 'btn btn-secondary btn-action error-action-btn'"],
     ['caption-export.js', "button.className = 'btn btn-secondary btn-action'"],
 ];

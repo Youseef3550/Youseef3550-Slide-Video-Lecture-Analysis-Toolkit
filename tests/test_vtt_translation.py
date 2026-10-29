@@ -3,6 +3,8 @@ import asyncio
 import tempfile
 import unittest
 import zipfile
+import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -15,7 +17,6 @@ from processors.summary_processor import SummaryProcessor
 from vtt_translation import (
     parse_vtt, translated_vtt, translate_vtt_batch, MAX_FILES,
     MAX_FILE_BYTES, MAX_BATCH_BYTES, TRANSLATION_MODELS,
-    grouped_vtt_segments, ungroup_vtt_segments,
 )
 
 
@@ -40,29 +41,90 @@ Second line
 
 
 class VttTranslationTests(unittest.TestCase):
-    def test_grouping_reduces_ids_without_changing_cues_or_formatting(self):
+    def test_vtt_retry_keeps_completed_files_and_partial_fragments(self):
+        calls = []
+        fail = True
+        async def translate(segments, target, model, _done, **kwargs):
+            for index, segment in enumerate(segments):
+                identity = f"segment-{index}"
+                if identity in _done:
+                    continue
+                calls.append(segment["text"])
+                if fail and segment["text"] == "Second":
+                    raise RuntimeError("429 daily quota")
+                _done.update({identity: "translated " + segment["text"]})
+            return {"transcript": [
+                {**segment, "text": _done[f"segment-{index}"]} for index, segment in enumerate(segments)]}
+        files = [(name + ".vtt", parse_vtt(
+            f"WEBVTT\n\n00:00.000 --> 00:01.000\n{name}\n".encode(),
+        )) for name in ("First", "Second")]
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            checkpoint_dir = workspace / "checkpoints"
+            processor = SimpleNamespace(translate_transcript=translate)
+            with self.assertRaisesRegex(RuntimeError, "Second.vtt"):
+                asyncio.run(translate_vtt_batch(
+                    files, "de", "", processor, workspace, lambda _: None, checkpoint_dir=checkpoint_dir,
+                ))
+            self.assertEqual(calls, ["First", "Second"])
+            fail = False
+            calls.clear()
+            response = asyncio.run(translate_vtt_batch(
+                files, "de", "", processor, workspace, lambda _: None, checkpoint_dir=checkpoint_dir,
+            ))
+            self.assertEqual(calls, ["Second"])
+            with zipfile.ZipFile(response.path) as archive:
+                self.assertIn("translated First", archive.read("First_DE.vtt").decode())
+                self.assertIn("translated Second", archive.read("Second_DE.vtt").decode())
+            self.assertEqual(list(checkpoint_dir.iterdir()), [])
+
+    def test_zip_translates_plain_fragments_without_model_controlled_markers(self):
+        processor = SummaryProcessor.__new__(SummaryProcessor)
+        processor.model = True
+        processor.model_name = "gemini-test"
+        processor._refresh_clients = lambda: None
+        processor._provider_chain = lambda *args, **kwargs: [("gemini", "gemini-test")]
+        requests = []
+        def complete(provider, model, prompt, *args):
+            payload = json.loads(prompt.split("\n", 1)[1])
+            requests.append(payload["lines"])
+            return json.dumps({"translations": [
+                {"id": item["id"], "text": re.sub(r"\[\[VTT_[0-9]+\]\]", "", item["text"])
+                 .replace("Hello", "Hallo").replace("Second", "Zweite")}
+                for item in payload["lines"]
+            ]})
+        processor._complete = complete
+        with tempfile.TemporaryDirectory() as temporary:
+            response = asyncio.run(translate_vtt_batch(
+                [("source.vtt", parse_vtt(VTT))], "de", "gemini-test", processor, temporary, lambda _: None))
+            with zipfile.ZipFile(response.path) as archive:
+                output = archive.read("source_DE.vtt").decode()
+                self.assertIn("<v Speaker><b>Hallo &amp; welcome</b></v>\nZweite line", output)
+                self.assertEqual(parse_vtt(output.encode())["cues"], 2)
+                report = json.loads(archive.read("translation-report.json"))[0]
+                self.assertEqual(report["usage"]["requests"], 1)
+                self.assertEqual(report["translation_items"], 3)
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(all("[[VTT_" not in item["text"] for item in requests[0]))
+
+    def test_plain_fragment_batches_preserve_cues_and_formatting(self):
         content = b"WEBVTT\n\n" + b"\n\n".join(
             f"cue-{index}\n00:{index // 60:02d}:{index % 60:02d}.000 --> "
             f"00:{(index + 1) // 60:02d}:{(index + 1) % 60:02d}.000\n"
             "<b>Hello</b>\nWorld".encode() for index in range(80)
         )
         parsed = parse_vtt(content)
-        groups, boundaries = grouped_vtt_segments(parsed)
         self.assertEqual(len(parsed["segments"]), 160)
-        self.assertEqual(len(groups), 20, "Eight fragments share each translation item")
         before = SummaryProcessor._translation_batches(parsed["segments"], 30, 2500)
-        after = SummaryProcessor._translation_batches(groups, 30, 2500)
+        after = SummaryProcessor._translation_batches(parsed["segments"], 60, 2500)
         self.assertEqual(len(before), 6)
-        self.assertEqual(len(after), 1, "Short-fragment fixture needs one batch instead of six")
+        self.assertEqual(len(after), 3)
         translated = [{"text": item["text"].replace("Hello", "Hallo").replace("World", "Welt")}
-                      for item in groups]
-        output = translated_vtt(parsed, ungroup_vtt_segments(translated, boundaries))
+                      for item in parsed["segments"]]
+        output = translated_vtt(parsed, translated)
         self.assertEqual(parse_vtt(output.encode())["cues"], 80)
         self.assertEqual(output.count("<b>Hallo</b>\nWelt"), 80)
         self.assertEqual(content.decode().replace("Hello", "Hallo").replace("World", "Welt") + "\n", output)
-        translated[0]["text"] = translated[0]["text"].replace(boundaries[0][0], "")
-        with self.assertRaisesRegex(ValueError, "boundaries"):
-            ungroup_vtt_segments(translated, boundaries)
 
     def test_preserves_metadata_timestamps_markup_and_newlines(self):
         parsed = parse_vtt(b"\xef\xbb\xbf" + VTT.replace(b"\n", b"\r\n"))
@@ -138,7 +200,7 @@ class VttTranslationTests(unittest.TestCase):
         node = next(node for node in ast.parse(source.read_text(encoding="utf-8")).body
                     if isinstance(node, ast.AsyncFunctionDef) and node.name == "start_vtt_translation_job")
         app = FastAPI()
-        store = SimpleNamespace(start=Mock(return_value="a" * 32))
+        store = SimpleNamespace(start=Mock(return_value="a" * 32), root=Path("test-exports") / "jobs")
         renderer = AsyncMock()
         processor = object()
         namespace = dict(app=app, File=File, Form=Form, UploadFile=UploadFile,
@@ -154,6 +216,11 @@ class VttTranslationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["job_id"], "a" * 32)
         self.assertEqual(store.start.call_args.args[0], "vtt-batch")
+        for service in ("libretranslate", "microsoft-translator"):
+            self.assertEqual(client.post("/vtt_translation_jobs",
+                data={"target_language": "de", "model": service, "allow_fallback": "false"},
+                files=files).status_code, 200)
+        response = client.post("/vtt_translation_jobs", data=data, files=files)
         generate = store.start.call_args.args[2]
         asyncio.run(generate("vtt-batch", {}, print, None, Path("workspace")))
         args = renderer.call_args.args
@@ -173,7 +240,7 @@ class VttTranslationTests(unittest.TestCase):
                                     files=files * 16).status_code, 400)
         with tempfile.TemporaryDirectory() as temporary:
             store = ExportJobStore(Path(temporary) / "jobs")
-            async def translate(segments, target, model, on_progress, allow_fallback=True):
+            async def translate(segments, target, model, on_progress, allow_fallback=True, _done=None):
                 return {"transcript": [{"text": item["text"].replace("Hello", "Translated")}
                                        for item in segments]}
             namespace["export_jobs"] = store

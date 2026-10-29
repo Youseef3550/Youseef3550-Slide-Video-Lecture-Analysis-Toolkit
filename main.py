@@ -4,6 +4,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import os
 import json
+import copy
+import logging
 import hashlib
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
@@ -31,12 +33,15 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Image as PdfImage, ListFlowable, ListItem, Paragraph, SimpleDocTemplate, Spacer
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+import math
 import time
 import html
 from collections import Counter
 from PIL import Image as PillowImage, UnidentifiedImageError
 from dotenv import load_dotenv
 from export_jobs import ExportJobStore, export_workspace, cleanup_export_workspace
+import library
+import chapter_projects
 from starlette.background import BackgroundTask
 from ffmpeg_tools import media_executable
 from caption_exports import validate_captions, render_captioned_video, video_duration, caption_text, caption_filename, validate_caption_style, render_caption_preview, render_selectable_captions
@@ -48,12 +53,19 @@ from project_paths import STATIC_DIR, VIDEO_DIR, TRANSCRIPTS_DIR, SCENES_DIR, TH
 from processors.video_processor import VideoProcessor
 from processors.scene_processor import SceneProcessor
 from processors.ocr_processor import OCRProcessor
-from processors.transcript_processor import TranscriptProcessor, get_huggingface_token
+from processors.transcript_processor import TranscriptProcessor, get_huggingface_token, SPEAKER_MODES
 from cloud_transcribe import cloud_provider_status, recommended_transcription_model
 from transcribe import get_whisper_device_config
 from processors.embedding_processor import EmbeddingProcessor
 from processors.summary_processor import SummaryProcessor
 from processors import transcript_versions
+from content_edits import router as content_edits_router
+from chapter_projects import router as chapter_projects_router, save_video_metadata
+from library_search import router as library_search_router
+import content_edits
+from content_languages import localized_scenes, scene_title
+import video_summary
+from content_history import router as content_history_router, ContentHistoryMiddleware
 
 load_dotenv()
 
@@ -69,6 +81,12 @@ from quiz_routes import router as quiz_router
 app.include_router(quiz_router)
 from notes_routes import router as notes_router
 app.include_router(notes_router)
+app.include_router(content_edits_router)
+app.include_router(chapter_projects_router)
+app.include_router(library.router)
+app.include_router(library_search_router)
+app.include_router(content_history_router)
+app.add_middleware(ContentHistoryMiddleware)
 
 ensure_app_directories()
 
@@ -103,10 +121,11 @@ async def yolo_status():
 async def runtime_status():
     """Report the compute device used by Whisper and available CUDA GPU."""
     summary_processor._refresh_clients()
-    default_chain = summary_processor._provider_chain(prefer_groq=True)
+    default_chain = summary_processor._translation_chain()
     translation_status = {
         "translation_default_provider": (
-            {"gemini": "Gemini", "groq": "Groq", "openai": "OpenAI"}[default_chain[0][0]]
+            {"gemini": "Gemini", "groq": "Groq", "openai": "OpenAI",
+             "libretranslate": "LibreTranslate", "microsoft": "Microsoft Translator"}[default_chain[0][0]]
             if default_chain else None
         ),
         "translation_default_model": default_chain[0][1] if default_chain else None,
@@ -116,6 +135,7 @@ async def runtime_status():
         "openai_configured": bool(summary_processor.openai_client),
         "groq_configured": bool(summary_processor.groq_client),
         "huggingface_token_configured": bool(get_huggingface_token()),
+        "speaker_modes": list(SPEAKER_MODES),
         "transcription_providers": cloud_provider_status(),
     }
     try:
@@ -161,6 +181,7 @@ scene_processor = SceneProcessor()
 transcript_processor = TranscriptProcessor()
 embedding_processor = EmbeddingProcessor()
 summary_processor = SummaryProcessor()
+app.state.summary_processor = summary_processor
 
 def parse_uploaded_transcript(text, suffix):
     if suffix == ".json":
@@ -308,6 +329,8 @@ async def translate_transcript(video_id: str, request: Request):
         for index, (_, _, _, text) in enumerate(chapter_fields)
     ]
     progress_key = f"{video_id}:{target}"
+    if translation_progress.get(progress_key, {}).get("status") == "running":
+        raise HTTPException(status_code=409, detail="Translation to this language is already running.")
     translation_progress[progress_key] = {
         "status": "running",
         "completed_segments": 0,
@@ -322,17 +345,21 @@ async def translate_transcript(video_id: str, request: Request):
         }
 
     try:
-        translation = await summary_processor.translate_transcript(
-            [*transcript, *chapter_segments], target, requested_model, on_progress=on_progress,
+        from translation_checkpoint import translate_with_resume
+        translation = await translate_with_resume(
+            summary_processor, [*transcript, *chapter_segments], target, requested_model,
+            checkpoint_dir=EXPORTS_DIR / "translation-checkpoints", on_progress=on_progress,
             allow_fallback=allow_fallback,
         )
     except (RuntimeError, ValueError, asyncio.TimeoutError, json.JSONDecodeError) as error:
         translation_progress[progress_key] = {
+            **translation_progress[progress_key],
             "status": "error", "message": str(error), "updated_at": time.time(),
         }
         raise HTTPException(status_code=502, detail=str(error)) from error
     except Exception as error:
         translation_progress[progress_key] = {
+            **translation_progress[progress_key],
             "status": "error", "message": str(error), "updated_at": time.time(),
         }
         raise
@@ -383,6 +410,7 @@ async def translate_transcript(video_id: str, request: Request):
         "batch_count": translation["batch_count"],
         "elapsed_seconds": translation["elapsed_seconds"],
         "usage": translation.get("usage"),
+        "resumed_segments": translation.get("resumed_segments", 0),
     }
 
 @app.get("/transcript_versions/{video_id}")
@@ -469,15 +497,7 @@ async def upload_video(background_tasks: BackgroundTasks, video: UploadFile = Fi
 
         video_hash = hasher.hexdigest()
         video_path = str(VIDEO_DIR / f"{video_hash}.mp4")
-        metadata_path = VIDEO_DIR / "metadata.json"
-        metadata = {}
-        if metadata_path.exists():
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                metadata = {}
-        metadata[video_hash] = {"filename": video.filename or f"{video_hash}.mp4"}
-        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        save_video_metadata(video_hash, {"filename": video.filename or f"{video_hash}.mp4"})
 
         # Check if video exists
         if os.path.exists(video_path):
@@ -504,18 +524,31 @@ async def uploaded_videos():
     except (OSError, json.JSONDecodeError):
         metadata = {}
     videos = []
+    variations = {}
+    for job in export_jobs.list():
+        if (job["status"] == "complete" and job["title"].startswith("Captioned video - ")
+                and job.get("filename", "").lower().endswith(".mp4")):
+            try:
+                export_jobs.file(job["id"], job["download_file"])
+            except FileNotFoundError:
+                continue
+            variations.setdefault(job["video_id"], []).append({
+                "id": job["id"], "filename": job["filename"],
+            })
     for video_path in sorted(VIDEO_DIR.glob("*"), key=lambda path: path.stat().st_mtime, reverse=True):
         if (
             not video_path.is_file()
             or video_path.name == "metadata.json"
             or video_path.name.endswith("_video_quality.json")
+            or video_path.suffix == ".pending"
         ):
             continue
         videos.append({
             "video_id": video_path.stem,
             "filename": metadata.get(video_path.stem, {}).get("filename", video_path.name),
             "size_bytes": video_path.stat().st_size,
-            "modified_at": video_path.stat().st_mtime
+            "modified_at": video_path.stat().st_mtime,
+            "caption_variations": variations.get(video_path.stem, []),
         })
     return {"success": True, "videos": videos}
 
@@ -540,6 +573,14 @@ async def stream_video(video_id: str, range: Optional[str] = Header(None)):
 async def get_scenes(video_id: str):
     return await scene_processor.get_scenes(video_id)
 
+@app.get("/scene_history/{video_id}")
+async def scene_history(video_id: str):
+    from processors.scene_history import list_sets
+    try:
+        return {"sets": await asyncio.to_thread(list_sets, video_id)}
+    except (OSError, ValueError, TypeError) as error:
+        raise HTTPException(400, f"Could not load slide history: {error}") from error
+
 @app.post("/detect_scenes/{video_id}")
 async def detect_scenes(video_id: str, request: Request, background_tasks: BackgroundTasks):
     video_path = video_processor.get_video_path(video_id)
@@ -558,6 +599,7 @@ async def detect_scenes(video_id: str, request: Request, background_tasks: Backg
             ),
             "maximum_slides_per_hour": int(data.get("maximum_slides_per_hour", 60)),
             "merge_similar_slides": bool(data.get("merge_similar_slides", True)),
+            "preserve_slide_replacements": data.get("preserve_slide_replacements", True),
             "include_chapter_boundaries": bool(data.get("include_chapter_boundaries", True)),
             "screenshot_height": int(data.get("screenshot_height", 720)),
         }
@@ -565,12 +607,14 @@ async def detect_scenes(video_id: str, request: Request, background_tasks: Backg
         raise HTTPException(status_code=400, detail="Invalid scene detection options")
     if mode not in {"adaptive", "content", "chapters"}:
         raise HTTPException(status_code=400, detail="Invalid scene detection mode")
+    if type(options["preserve_slide_replacements"]) is not bool:
+        raise HTTPException(status_code=400, detail="Preserve slide replacements must be true or false")
     if options["adaptive_detail"] not in {"fewer", "balanced", "more"}:
         raise HTTPException(status_code=400, detail="Invalid adaptive detail level")
     if not 10 <= options["content_threshold"] <= 60:
         raise HTTPException(status_code=400, detail="Content-cut threshold must be between 10 and 60")
     if options["minimum_slide_duration_percent"] is not None:
-        if options["minimum_slide_duration_percent"] not in {0.25, 0.5, 1, 2}:
+        if options["minimum_slide_duration_percent"] not in {0, 0.25, 0.5, 1, 2}:
             raise HTTPException(status_code=400, detail="Invalid minimum slide duration percentage")
     elif options["minimum_slide_duration"] not in {5, 10, 20, 30}:
         raise HTTPException(status_code=400, detail="Invalid minimum slide duration")
@@ -646,7 +690,7 @@ async def download_scene_screenshots(video_id: str):
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"{video_id}_slide_screenshots.zip"
+        filename=screenshot_archive_filename(video_id)
     )
 
 # Slide downloads are independent of chapter clip/transcript export jobs.
@@ -678,17 +722,17 @@ async def download_selected_slides(video_id: str, request: Request):
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
     return StreamingResponse(
         iter([archive.getvalue()]), media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{video_id}_slides.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{screenshot_archive_filename(video_id)}"'},
     )
 
 
 @app.get("/download_slide_text_docx/{video_id}")
-async def download_slide_text_docx(video_id: str, transcript_language: str = ""):
+async def download_slide_text_docx(video_id: str, transcript_language: str = "", chapter_language: str | None = None):
     from slide_exports import SlideExportError, build_slide_text_document
     try:
         document = await asyncio.to_thread(
             build_slide_text_document, video_id, SCENES_DIR, FULLSIZE_IMAGES_DIR, SUMMARIES_DIR,
-            transcript_language=transcript_language,
+            transcript_language=transcript_language if chapter_language is None else chapter_language,
         )
     except SlideExportError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
@@ -799,6 +843,7 @@ async def generate_whisper_transcript(video_id: str, request: Request, backgroun
         str(options.get("model") or "") or None,
         str(options.get("prompt") or "").strip() or None,
         speakers_only=bool(options.get("speakers_only", False)),
+        speaker_mode=options.get("speaker_mode", "fast"),
     )
 
 @app.get("/whisper_transcript_status/{video_id}")
@@ -1125,26 +1170,233 @@ async def process_youtube(request: Request, background_tasks: BackgroundTasks):
             "error": str(e)
         })
 
+summary_generation_tasks = {}
+
+
+@app.post("/cancel_summary/{video_id}")
+async def cancel_summary(video_id: str):
+    task = summary_generation_tasks.get(video_id)
+    if task is None or task.done():
+        return {"success": False, "error": "No active chapter generation for this video."}
+    task.cancel()
+    return {"success": True}
+
+
 @app.post("/generate_summary")
 async def generate_summary(request: Request):
+    task = None
+    video_id = None
     try:
         data = await request.json()
         transcript = data.get("transcript", [])
         video_id = data.get("video_id")
+        if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+            raise ValueError("Invalid video ID.")
+        if video_id in summary_generation_tasks:
+            raise ValueError("Chapter generation is already running for this video.")
+        task = asyncio.current_task()
+        summary_generation_tasks[video_id] = task
+        basis = data.get("basis", "topics")
+        consider_slides = data.get("consider_slides", False)
+        slide_boundary_scope = data.get("slide_boundary_scope", "none")
+        if slide_boundary_scope not in ("none", "chapters", "sections", "both"):
+            raise ValueError("Invalid slide boundary scope.")
+        if basis == "speakers" and slide_boundary_scope != "none":
+            raise ValueError("Speaker-only chapters use exact speaker turns, not slide boundaries.")
+        if basis == "timestamps" and slide_boundary_scope in ("chapters", "both"):
+            raise ValueError("Exact chapter timestamps cannot use slide chapter boundaries. Select section boundaries only.")
+        if data.get("structure", "sections") == "flat" and slide_boundary_scope in ("sections", "both"):
+            raise ValueError("Choose chapters with sections to use slide section boundaries.")
+        if type(consider_slides) is not bool:
+            raise ValueError("Consider slides must be true or false.")
+        slide_starts = None
+        timestamp_options = {}
+        if basis == "timestamps":
+            source = chapter_projects._media_source(video_id, {})
+            timestamp_options = {"cut_points": data.get("cut_points"),
+                                 "video_duration_seconds": await video_duration(source)}
+        if (consider_slides and basis == "topics") or slide_boundary_scope != "none":
+            if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+                raise ValueError("Invalid video ID.")
+            scenes_path = SCENES_DIR / f"{video_id}.json"
+            if not scenes_path.is_file():
+                raise ValueError("Detect slides first, or turn off Consider detected slide changes in Chapter options.")
+            scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
+            slide_starts = sorted({float(scene["time_seconds"]) for scene in scenes})
+            if not slide_starts or any(not math.isfinite(start) or start < 0 for start in slide_starts):
+                raise ValueError("No valid detected slides are available. Detect slides again or turn off slide-aware generation.")
+        boundary_slides = slide_starts if slide_boundary_scope != "none" else None
+        if not consider_slides or basis != "topics":
+            slide_starts = None
         return await summary_processor.generate_summary(
             transcript, video_id, data.get("model"), data.get("language", "transcript"),
             structure=data.get("structure", "sections"), detail=data.get("detail", "balanced"),
             instructions=str(data.get("instructions") or ""),
+            transcript_language=data.get("transcript_language", ""),
+            passes=data.get("passes", "one"),
+            slide_starts=slide_starts,
+            basis=basis,
+            boundary_slide_starts=boundary_slides,
+            slide_boundary_scope=slide_boundary_scope,
+            flag_transcript_gaps=data.get("flag_transcript_gaps", False),
+            transcript_gap_seconds=data.get("transcript_gap_seconds", 10),
+            **timestamp_options,
         )
+    except asyncio.CancelledError:
+        return JSONResponse({"success": False, "cancelled": True,
+                             "error": "Chapter generation stopped. Existing chapters were preserved."})
     except Exception as e:
         return JSONResponse({
             "success": False,
             "error": str(e)
         })
+    finally:
+        if task is not None and summary_generation_tasks.get(video_id) is task:
+            summary_generation_tasks.pop(video_id, None)
+
+
+@app.post("/video_summary/{video_id}/load")
+async def load_video_summary(video_id: str, data: dict):
+    path, _, _ = video_summary.summary_context(video_id, data)
+    return video_summary.load_summary(path)
+
+
+@app.post("/video_summary/{video_id}/generate")
+async def generate_video_summary(video_id: str, data: dict):
+    path, transcript, language = video_summary.summary_context(video_id, data)
+    try:
+        result = await summary_processor.generate_video_summary(transcript, data.get("model"), language)
+        video_summary.save_summary(path, result)
+        return {"success": True, **result}
+    except Exception as error:
+        logging.exception("Whole-video summary failed for %s", video_id)
+        raise HTTPException(502, f"Could not generate the video summary: {error}") from error
+
 
 @app.get("/summary/{video_id}")
 async def get_summary(video_id: str, language: str = ""):
     return await summary_processor.get_summary(video_id, language)
+
+
+@app.post("/chapter_tools/{video_id}")
+async def chapter_tools(video_id: str, request: Request):
+    data = await request.json()
+    kind = data.get("kind")
+    operation = data.get("operation")
+    if kind not in ("chapters", "slides") or operation not in ("enhance", "translate", "review"):
+        raise HTTPException(400, "Invalid content action.")
+    language = data.get("language", "")
+    selected_language = data.get("transcript_language", "")
+    source = data.get("source", "whisper")
+    version_id = data.get("version_id", "")
+    with content_edits._lock:
+        original, context = content_edits._snapshot(
+            video_id, kind, language, source, version_id, selected_language,
+        )
+        revision = content_edits._revision(original)
+        target = language if operation in ("enhance", "review") else data.get("target_language")
+        if target == "transcript":
+            transcript = context[1] if context else content_edits._snapshot(
+                video_id, "transcript", selected_language, source, version_id, selected_language,
+            )[0]
+            target = selected_language or detect_transcript_language(transcript)
+        if target not in ("", "en", "de", "ar", "pl") or (operation == "translate" and not target):
+            raise HTTPException(400, "Choose a supported target language.")
+        target_path = SUMMARIES_DIR / (f"{video_id}_summary_{target}.json" if target else f"{video_id}.json")
+        target_revision = content_edits._revision(content_edits._read(target_path, None))
+    if not original:
+        raise HTTPException(400, "Load saved content before using this action.")
+    try:
+        if operation in ("enhance", "review"):
+            if kind != "chapters":
+                raise HTTPException(400, "Enhancement applies to chapters and sections.")
+            summary_processor._refresh_clients()
+            chain = summary_processor._provider_chain(data.get("model"), prefer_groq=True)
+            if not chain:
+                raise HTTPException(400, summary_processor._no_provider_message())
+            provider, model = chain[0]
+            if operation == "review":
+                content = await summary_processor.review_disruptions(original, context[1], provider, model)
+            else:
+                content = await summary_processor.enhance_chapters(
+                    original, provider, model,
+                    summary_processor._chapter_settings("sections", data.get("detail", "balanced"), data.get("instructions", "")),
+                    summary_processor._summary_language_instruction(language or selected_language or "transcript"),
+                )
+                content = await summary_processor._verify_chapter_boundaries(content, context[1], provider, model)
+                content = await summary_processor._verify_section_boundaries(content, context[1], provider, model)
+            content = [{**chapter, "user_edited": True} for chapter in content]
+        else:
+            content = copy.deepcopy(original)
+            fields = []
+            if kind == "chapters":
+                for chapter in content:
+                    for item, names in [(chapter, ("title", "summary")), *[
+                        (section, ("title", "point")) for section in chapter.get("sections") or []
+                    ]]:
+                        for name in names:
+                            if isinstance(item.get(name), str) and item[name].strip():
+                                fields.append((item, name, item[name]))
+            else:
+                chapter_language = data.get("chapter_language", language)
+                if chapter_language not in ("", "en", "de", "ar", "pl"):
+                    raise HTTPException(400, "Invalid chapter language.")
+                chapter_path = SUMMARIES_DIR / (
+                    f"{video_id}_summary_{chapter_language}.json" if chapter_language else f"{video_id}.json"
+                )
+                chapters = content_edits._read(chapter_path, [])
+                if not chapters and chapter_language:
+                    chapters = content_edits._read(SUMMARIES_DIR / f"{video_id}.json", [])
+                for scene in content:
+                    title = scene_title(scene, language)
+                    if not title:
+                        seconds = float(scene["time_seconds"] if "time_seconds" in scene
+                                        else parse_chapter_timestamp(scene["timestamp"]))
+                        matching = [chapter for chapter in chapters if parse_chapter_timestamp(chapter["timestamp"]) <= seconds]
+                        if matching:
+                            chapter = matching[-1]
+                            sections = [section for section in chapter.get("sections") or []
+                                        if parse_chapter_timestamp(section["timestamp"]) <= seconds]
+                            title = (sections[-1] if sections else chapter)["title"]
+                    if title:
+                        fields.append((scene, "title", title))
+            if not fields:
+                raise HTTPException(400, "There are no saved or topic-derived titles to translate.")
+            result = await summary_processor.translate_transcript([
+                {"start": index, "duration": 1, "text": text} for index, (_, _, text) in enumerate(fields)
+            ], target, data.get("model"))
+            translated = result["transcript"]
+            if len(translated) != len(fields):
+                raise ValueError("Translation did not return every title and section.")
+            for (item, name, _), translated_item in zip(fields, translated):
+                text = translated_item.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("Translation returned an empty title or section.")
+                if kind == "slides":
+                    item["title_translations"] = {**(item.get("title_translations") or {}), target: text.strip()}
+                else:
+                    item[name] = text.strip()
+            if kind == "chapters":
+                content = [{**chapter, "user_edited": True} for chapter in content]
+        with content_edits._lock:
+            latest, _ = content_edits._snapshot(video_id, kind, language, source, version_id, selected_language)
+            if content_edits._revision(latest) != revision:
+                raise HTTPException(409, "Content changed while processing. Reopen it and try again.")
+            if kind == "chapters":
+                if content_edits._revision(content_edits._read(target_path, None)) != target_revision:
+                    raise HTTPException(409, "The target-language chapters changed while processing. Try again.")
+                entry, transcript, _ = context
+                content_edits.persist_chapters(
+                    video_id, content, (entry, transcript, target_path), target, selected_language, source,
+                )
+            else:
+                transcript_versions._write_json(SCENES_DIR / f"{video_id}.json", content)
+        return {"success": True, "content": content, "language": target}
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.exception("Content action %s failed for %s", operation, video_id)
+        raise HTTPException(502, f"Could not {operation} {kind}: {error}") from error
 
 def ascii_filename(text: str) -> str:
     import unicodedata
@@ -1153,6 +1405,20 @@ def ascii_filename(text: str) -> str:
         text = text.replace(source, target)
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")[:80]
+
+
+def screenshot_archive_filename(video_id: str) -> str:
+    metadata_path = VIDEO_DIR / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+    except (OSError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=500, detail="Could not read the original video filename.") from error
+    if not isinstance(metadata, dict) or not isinstance(metadata.get(video_id, {}), dict):
+        raise HTTPException(status_code=500, detail="Invalid saved video filename metadata.")
+    filename = metadata.get(video_id, {}).get("filename") or "lecture"
+    if not isinstance(filename, str):
+        raise HTTPException(status_code=500, detail="Invalid saved video filename.")
+    return f"{ascii_filename(Path(filename).stem) or 'lecture'}_screenshots.zip"
 
 
 @app.post("/export_suggestions/{video_id}")
@@ -1243,6 +1509,10 @@ def chapter_boundaries_from_topics(chapters):
         if not isinstance(chapter, dict) or "timestamp" not in chapter:
             continue
         boundary = {"timestamp": str(chapter["timestamp"]), "title": str(chapter.get("title", f"Chapter {index + 1}"))}
+        if chapter.get("timestamp_edited"):
+            boundary["timestamp_edited"] = True
+        if chapter.get("user_edited"):
+            boundary["user_edited"] = True
         if str(chapter.get("summary") or "").strip():
             boundary["summary"] = str(chapter["summary"]).strip()
         if isinstance(chapter.get("sections"), list):
@@ -1258,9 +1528,9 @@ def saved_section_points(chapter):
     """Turn sections saved with generated chapters into export key points."""
     points = []
     for section in chapter.get("sections") or []:
-        title = clean_outline_title(section.get("title"))
-        text = strip_narration(section.get("point"))
-        if not title or not text:
+        title = str(section.get("title") or "").strip() if chapter.get("user_edited") else clean_outline_title(section.get("title"))
+        text = str(section.get("point") or "").strip() if chapter.get("user_edited") else strip_narration(section.get("point"))
+        if not title or (not text and not chapter.get("user_edited")):
             return []
         try:
             start = parse_chapter_timestamp(str(section["timestamp"]))
@@ -1268,7 +1538,8 @@ def saved_section_points(chapter):
             return []
         if chapter["end"] is not None and start >= chapter["end"]:
             continue
-        points.append({"start": max(start, chapter["start"]), "title": title, "text": text})
+        points.append({"start": max(start, chapter["start"]), "title": title, "text": text,
+                       **({"timestamp_edited": True} if section.get("timestamp_edited") else {})})
     return sorted(points, key=lambda point: point["start"])
 
 
@@ -1331,6 +1602,7 @@ def chapter_boundaries_from_scenes(scenes):
             "timestamp": str(scene["timestamp"]),
             "time_seconds": float(scene.get("time_seconds", parse_chapter_timestamp(str(scene["timestamp"])))),
             "title": str(scene.get("title") or f"Slide change {index + 1}"),
+            "title_edited": bool(scene.get("title_edited")),
             "image_index": index,
             "slide_text": scene_slide_text(scene),
         }
@@ -1451,7 +1723,7 @@ def align_export_chapters(chapters, sentences):
     result = []
     for chapter in sorted(chapters, key=lambda item: parse_chapter_timestamp(item["timestamp"])):
         source_start = parse_chapter_timestamp(chapter["timestamp"])
-        start = 0 if not result else next(
+        start = source_start if chapter.get("timestamp_edited") else 0 if not result else next(
             (item["start"] for item in sentences if item["start"] >= source_start), None
         )
         if start is None:
@@ -1464,7 +1736,9 @@ def align_export_chapters(chapters, sentences):
         result.append({
             "index": len(result) + 1, "title": chapter["title"],
             "start": start, "source_start": source_start, "end": None,
-            **{key: chapter[key] for key in ("summary", "sections") if chapter.get(key)},
+            **{key: chapter[key] for key in (
+                "summary", "sections", "user_edited", "title_edited", "timestamp_edited",
+            ) if key in chapter},
         })
     for current, following in zip(result, result[1:]):
         current["end"] = following["start"]
@@ -1575,7 +1849,9 @@ async def summarize_export_batch(sentences, section_starts=None, extras=None):
         "title (a clear chapter heading of 2 to 6 words, a specific topic noun phrase in title case, "
         "not a sentence, no trailing punctuation or ellipsis); "
         "summary (one or two concise sentences stating what the learner will learn); "
-        "points (1 to 4 important key points). "
+        "points (one per genuinely different subtopic, normally 1 to 4; use just one if the topic never changes). "
+        "These points become navigation subsections, so do not split one discussion into individual sentences, "
+        "examples, demonstration steps, questions or answers. Multiple related facts belong in one point. "
         "Each point must contain sentence_id (an input id), title (a specific topic noun phrase of at most "
         "5 words, not a sentence and not 'Key point'), and text (a concise complete sentence with terminal "
         "punctuation, grounded only in this transcript)."
@@ -1652,7 +1928,9 @@ def build_export_subparts(chapter, sentences, points, scenes, mode, section_titl
             source_start = entry["start"] if kind == "point" else export_slide_start(entry)
             if source_start < chapter["start"] or (chapter["end"] is not None and source_start >= chapter["end"]):
                 continue
-            start = next((item["start"] for item in sentences if item["start"] >= source_start), None)
+            start = source_start if entry.get("timestamp_edited") else next(
+                (item["start"] for item in sentences if item["start"] >= source_start), None,
+            )
             if start is None or (chapter["end"] is not None and start >= chapter["end"]):
                 # Still retain the slide event, even if it occurs during the last sentence.
                 start = sentences[-1]["start"] if sentences else chapter["start"]
@@ -1661,7 +1939,9 @@ def build_export_subparts(chapter, sentences, points, scenes, mode, section_titl
     boundaries.setdefault(chapter["start"], {"start": chapter["start"], "points": [], "slides": []})
     subparts = [boundaries[start] for start in sorted(boundaries)]
     # Opening speech belongs to the first real topic, not an invented transcript heading.
-    if mode == "points" and len(subparts) > 1 and not subparts[0]["points"] and not section_titles.get(chapter["start"]):
+    if (mode == "points" and len(subparts) > 1 and not subparts[0]["points"]
+            and not section_titles.get(chapter["start"])
+            and not any(point.get("timestamp_edited") for point in subparts[1]["points"])):
         opening = subparts.pop(0)
         subparts[0]["start"] = opening["start"]
     for index, subpart in enumerate(subparts):
@@ -1672,7 +1952,8 @@ def build_export_subparts(chapter, sentences, points, scenes, mode, section_titl
         ]
         subpart["title"] = (
             subpart["points"][0]["title"] if subpart["points"] else
-            section_titles.get(subpart["start"])
+            next((scene["title"] for scene in subpart["slides"] if scene.get("title_edited")), None)
+            or section_titles.get(subpart["start"])
             or chapter["title"]
         )
     return subparts
@@ -1694,6 +1975,8 @@ def export_archive_paths(directory, flags):
         names.add("video_outline.docx")
     if flags["include_transcripts"]:
         names.update({"transcript_by_chapter.md", "chapters.json"})
+    if flags.get("include_screenshot_transcript"):
+        names.add("screenshots_transcript.html")
     return [
         path for path in directory.iterdir() if path.name in names
         or (path.suffix == ".jpg" and (flags["include_images"] or webpage))
@@ -1862,12 +2145,13 @@ def create_combined_chapter_documents(
             ])
         if pdf_story is not None and pdf_text:
             for subpart_index, subpart in enumerate(files.get("subparts", []), start=1):
-                pdf_story.append(pdf_paragraph(
-                    f"{index + 1}.{subpart_index} " + subpart["title"] + (
-                        f" ({format_chapter_timestamp(subpart['start'])})" if timestamp_mode != "part" else ""
-                    ),
-                    "Heading2",
-                ))
+                if len(files.get("subparts", [])) > 1:
+                    pdf_story.append(pdf_paragraph(
+                        f"{index + 1}.{subpart_index} " + subpart["title"] + (
+                            f" ({format_chapter_timestamp(subpart['start'])})" if timestamp_mode != "part" else ""
+                        ),
+                        "Heading2",
+                    ))
                 for scene in subpart["slides"]:
                     pdf_story.append(pdf_paragraph(
                         f"Slide at {format_chapter_timestamp(export_slide_start(scene))}", "Normal",
@@ -1896,11 +2180,12 @@ def create_combined_chapter_documents(
                 pass
         if word_document and word_text:
             for subpart_index, subpart in enumerate(files.get("subparts", []), start=1):
-                word_document.add_heading(
-                    f"{index + 1}.{subpart_index} " + subpart["title"] + (
-                        f" ({format_chapter_timestamp(subpart['start'])})" if timestamp_mode != "part" else ""
-                    ), level=2
-                )
+                if len(files.get("subparts", [])) > 1:
+                    word_document.add_heading(
+                        f"{index + 1}.{subpart_index} " + subpart["title"] + (
+                            f" ({format_chapter_timestamp(subpart['start'])})" if timestamp_mode != "part" else ""
+                        ), level=2
+                    )
                 for scene in subpart["slides"]:
                     word_document.add_paragraph(
                         f"Slide at {format_chapter_timestamp(export_slide_start(scene))}"
@@ -1943,6 +2228,11 @@ def collapse_word_heading(paragraph):
     paragraph_properties.append(OxmlElement("w:collapsed"))
 
 export_jobs = ExportJobStore(EXPORTS_DIR / "jobs")
+library.stores = {"exports": export_jobs, "projects": chapter_projects.jobs, "chapter-videos": chapter_projects.video_jobs}
+library.busy = lambda video_id: any(
+    key.startswith(video_id + ":") and value.get("status") == "running"
+    for key, value in translation_progress.items()
+)
 
 
 @app.post("/vtt_translation_jobs")
@@ -1977,7 +2267,8 @@ async def start_vtt_translation_job(
         async def generate(video_id, options, step, artifacts, workspace):
             return await translate_vtt_batch(
                 parsed_files, target_language, model, summary_processor, workspace, step,
-                allow_fallback=allow_fallback)
+                allow_fallback=allow_fallback,
+                checkpoint_dir=export_jobs.root.parent / "translation-checkpoints")
         job_id = export_jobs.start(
             "vtt-batch", {"document_title": f"VTT translation - {len(files)} files - {target_language.upper()}"},
             generate,
@@ -2171,6 +2462,17 @@ async def export_job_status(job_id: str):
     return read_export_job(job_id)
 
 
+@app.post("/export_jobs/{job_id}/cancel")
+async def cancel_caption_export(job_id: str):
+    state = read_export_job(job_id)
+    if not state["title"].startswith("Captioned video - "):
+        raise HTTPException(status_code=400, detail="Only captioned-video exports can be stopped here")
+    try:
+        return export_jobs.cancel(job_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @app.get("/saved_exports/{video_id}")
 async def saved_exports(video_id: str):
     return {"exports": export_jobs.list(video_id)}
@@ -2223,7 +2525,7 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
     timestamp_mode = options.get("timestamp_mode", "subpart")
     if timestamp_mode not in {"original", "part", "subpart"}:
         raise HTTPException(status_code=400, detail="Invalid timestamp mode")
-    subpart_mode = options.get("subpart_mode", "points")
+    subpart_mode = options.get("subpart_mode", "both")
     if subpart_mode not in {"points", "slides", "both"}:
         raise HTTPException(status_code=400, detail="Invalid subpart mode")
     format_selected = any(name.startswith("include_") for name in options)
@@ -2231,21 +2533,72 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
         "include_images", "include_transcripts", "include_clips",
         "include_word", "include_pdf", "include_webpage", "include_outline", "include_scorm",
         "include_section_clips",
+        "include_screenshot_transcript",
     )}
+    video_scope = options.get("video_scope", "both" if export_flags["include_section_clips"] else "chapters")
+    if video_scope not in {"chapters", "parts", "both"}:
+        raise HTTPException(400, "Invalid video scope; choose chapters, parts or both.")
+    video_requested = any(export_flags[name] for name in ("include_clips", "include_webpage", "include_scorm"))
+    chapter_videos = video_requested and video_scope != "parts"
+    export_flags["include_section_clips"] = export_flags["include_section_clips"] or (
+        video_requested and video_scope in {"parts", "both"})
     if not any(export_flags.values()):
         raise HTTPException(status_code=400, detail="Select at least one export option")
     video_path = (str(caption_copy_path(video_id, options["media_export_id"]))
                   if options.get("media_export_id") else video_processor.get_video_path(video_id))
     clip_stream_options = (["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-c:s", "mov_text"]
                            if options.get("media_export_id") else [])
+    chapter_language = options.get("chapter_language", transcript_language)
+    slide_title_language = options.get("slide_title_language", chapter_language)
+    if chapter_language not in ("", "en", "de", "ar", "pl") or slide_title_language not in ("", "en", "de", "ar", "pl"):
+        raise HTTPException(400, "Invalid chapter or slide title language")
     translated_summary_path = (
-        SUMMARIES_DIR / f"{video_id}_summary_{transcript_language}.json"
-        if transcript_language else None
+        SUMMARIES_DIR / f"{video_id}_summary_{chapter_language}.json"
+        if chapter_language else None
     )
     summary_path = translated_summary_path if translated_summary_path and translated_summary_path.is_file() else SUMMARIES_DIR / f"{video_id}.json"
     if not video_path:
         raise HTTPException(status_code=404, detail="Video not found")
     scene_path = SCENES_DIR / f"{video_id}.json"
+    screenshot_html = None
+    if export_flags["include_screenshot_transcript"]:
+        from slide_exports import SlideExportError, build_slide_transcript_html
+        screenshot_transcript = options.get("screenshot_transcript")
+        if screenshot_transcript is None:
+            candidates = (
+                [TRANSCRIPTS_DIR / f"{video_id}_translated_{transcript_language}.json"]
+                if transcript_language else []
+            ) + [
+                TRANSCRIPTS_DIR / f"{video_id}_whisper.json",
+                TRANSCRIPTS_DIR / f"{video_id}_youtube.json",
+                TRANSCRIPTS_DIR / f"{video_id}.json",
+            ]
+            screenshot_transcript = []
+            for candidate in candidates:
+                if candidate.is_file():
+                    screenshot_transcript = json.loads(candidate.read_text(encoding="utf-8"))
+                    break
+        screenshot_title = str(options.get("document_title", "")).strip() or Path(video_path).stem
+        step("Building screenshots and corresponding transcript HTML; no summaries or video encoding")
+        try:
+            screenshot_html = await asyncio.to_thread(
+                build_slide_transcript_html, video_id, screenshot_transcript,
+                SCENES_DIR, FULLSIZE_IMAGES_DIR, screenshot_title, slide_title_language=slide_title_language,
+            )
+        except SlideExportError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+        if not any(value for name, value in export_flags.items() if name != "include_screenshot_transcript"):
+            export_root.mkdir(parents=True, exist_ok=True)
+            requested_name = str(options.get("export_filename", "")).strip() or f"{screenshot_title}_screenshots_transcript"
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", requested_name).strip("._-") or "screenshots_transcript"
+            output = export_root / (Path(safe_name).stem + ".html" if Path(safe_name).suffix else safe_name + ".html")
+            output.write_text(screenshot_html, encoding="utf-8")
+            if on_artifacts:
+                with export_workspace(step) as directory:
+                    index = Path(directory) / "index.html"
+                    index.write_text(screenshot_html, encoding="utf-8")
+                    on_artifacts(Path(directory), [index], screenshot_title)
+            return FileResponse(output, media_type="text/html", filename=output.name)
     if interval_minutes is None and chapter_grouping in {"slides", "combined"} and not scene_path.is_file():
         if chapter_grouping == "slides":
             raise HTTPException(status_code=400, detail="Detect slides before exporting by slide changes")
@@ -2254,7 +2607,7 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
         scene_chapters = []
         if scene_path.is_file():
             with scene_path.open("r", encoding="utf-8") as file:
-                scene_chapters = chapter_boundaries_from_scenes(json.load(file))
+                scene_chapters = chapter_boundaries_from_scenes(localized_scenes(json.load(file), slide_title_language))
         if interval_minutes is not None:
             try:
                 interval_seconds = float(interval_minutes) * 60
@@ -2288,7 +2641,7 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                         chapter.pop("sections", None)
             if scene_path.is_file():
                 with scene_path.open("r", encoding="utf-8") as file:
-                    scene_chapters = chapter_boundaries_from_scenes(json.load(file))
+                    scene_chapters = chapter_boundaries_from_scenes(localized_scenes(json.load(file), slide_title_language))
             if chapter_grouping == "topic":
                 chapters = topic_chapters
             elif chapter_grouping == "slides":
@@ -2308,6 +2661,9 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
         transcript_candidates = (
             [TRANSCRIPTS_DIR / f"{video_id}_translated_{transcript_language}.json"]
             if transcript_language else []
+        ) + (
+            [TRANSCRIPTS_DIR / f"{video_id}_{options['transcript_source']}.json"]
+            if not transcript_language and options.get("transcript_source") in ("uploaded", "youtube", "whisper") else []
         ) + [
             TRANSCRIPTS_DIR / f"{video_id}_whisper.json",
             TRANSCRIPTS_DIR / f"{video_id}_youtube.json",
@@ -2364,6 +2720,8 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
             document_title = requested_title
         with export_workspace(step) as temp_dir_name:
             temp_dir = Path(temp_dir_name)
+            if screenshot_html is not None:
+                (temp_dir / "screenshots_transcript.html").write_text(screenshot_html, encoding="utf-8")
             generic_name = (
                 bool(re.fullmatch(r"[0-9a-f]{32,64}", document_title, re.IGNORECASE))
                 or document_title.lower() in {"video", "meeting", "recording", "input"}
@@ -2392,6 +2750,7 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
             chaptered_lines = [f"# {document_title}", ""]
             chapter_files = []
             image_cache = {}
+            section_image_cache = {}
             overlap_seconds = 1.0 if options.get("clip_overlap", True) else 0.0
             include_slide_text = bool(options.get("include_slide_text", False))
             if include_slide_text and not any(scene.get("slide_text") for scene in scene_chapters):
@@ -2400,9 +2759,9 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                 number = chapter["index"]
                 chapter["clip_start"] = max(0.0, chapter["start"] - (overlap_seconds if number > 1 else 0.0))
                 step(f"Part {number}/{len(chapter_data)}: preparing {chapter['title']}")
-                safe_title = re.sub(r"[^A-Za-z0-9_-]+", "_", chapter["title"]).strip("_") or f"chapter_{number}"
+                safe_title = re.sub(r"[^A-Za-z0-9_-]+", "_", chapter["title"]).strip("_")[:80] or f"chapter_{number}"
                 base_name = f"{number:02d}_{safe_title}"
-                clip_path = temp_dir / f"{base_name}.mp4"
+                clip_path = temp_dir / f"{number:02d}-{safe_title}.mp4"
                 image_path = temp_dir / f"{base_name}.jpg"
                 transcript_path = temp_dir / f"{base_name}.txt"
 
@@ -2413,13 +2772,20 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                 ]
                 if chapter["end"] is not None:
                     ffmpeg_clip.extend(["-t", str(chapter["end"] - chapter["clip_start"])])
-                ffmpeg_clip.extend([*clip_stream_options, "-c:v", "libx264", "-c:a", "aac", str(clip_path)])
-                if export_flags["include_clips"] or export_flags["include_webpage"] or export_flags["include_scorm"]:
+                ffmpeg_clip.extend([
+                    *clip_stream_options, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-c:a", "aac", str(clip_path),
+                ])
+                if chapter_videos:
                     ffmpeg_clip[0] = media_executable("ffmpeg")
                     step(f"Part {number}/{len(chapter_data)}: encoding video clip with FFmpeg")
                     if chapter["clip_start"] < chapter["start"]:
                         step(f"Clip starts {chapter['start'] - chapter['clip_start']:.1f}s early to preserve speech at the boundary")
-                    subprocess.run(ffmpeg_clip, check=True)
+                    from ffmpeg_tools import encode_export_clip
+                    await encode_export_clip(
+                        ffmpeg_clip, step, f"Part {number}/{len(chapter_data)}",
+                        chapter["end"] - chapter["clip_start"] if chapter["end"] is not None else None,
+                    )
                 if export_flags["include_images"] or export_flags["include_word"] or export_flags["include_pdf"] or export_flags["include_webpage"] or export_flags["include_scorm"]:
                     prepare_export_image(
                         video_id, video_path, chapter["start"], scene_chapters,
@@ -2483,8 +2849,8 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                         export_slide_start(scene) for scene in files["slide_subparts"]
                     ] if subpart_mode in {"slides", "both"} else []
                     ai_extras = {}
-                    saved_points = saved_section_points(chapter) if not chapter_slides else []
-                    if saved_points:
+                    saved_points = saved_section_points(chapter)
+                    if saved_points or chapter.get("user_edited"):
                         # Sections were already written when chapters were generated; reuse them.
                         step(f"Part {number}/{len(chapter_data)}: using the saved chapter sections")
                         points, point_method = saved_points, "Saved chapter sections"
@@ -2494,7 +2860,7 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                         points, point_method, chapter["summary"] = await export_key_points(
                             chapter_transcript, [chapter["start"], *chapter_slides], ai_extras,
                         )
-                    if ai_extras.get("title"):
+                    if ai_extras.get("title") and not chapter.get("title_edited"):
                         chapter["original_title"] = chapter["title"]
                         chapter["title"] = ai_extras["title"]
                     if subpart_mode in {"points", "both"}:
@@ -2505,12 +2871,18 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                         chapter, chapter_transcript, files["outline_points"], scene_chapters, subpart_mode,
                         ai_extras.get("section_titles"),
                     )
-                    for subpart in files["subparts"]:
+                    for subpart_index, subpart in enumerate(files["subparts"], start=1):
                         subpart["transcript"] = "\n".join(
                             format_export_transcript_item(item) if timestamp_mode == "original"
                             else re.sub(r"^\[[^\]]+\]\s*", "", format_export_transcript_item(item))
                             for item in subpart["sentences"]
                         )
+                        if not subpart["slides"] and (export_flags["include_webpage"] or export_flags["include_scorm"]):
+                            subpart["image"] = temp_dir / f"section_{number:02d}_{subpart_index:02d}.jpg"
+                            prepare_export_image(
+                                video_id, video_path, subpart["start"], [],
+                                subpart["image"], section_image_cache, step,
+                            )
                         for scene in subpart["slides"]:
                             slide_start = export_slide_start(scene)
                             scene["image"] = temp_dir / f"slide_{int(slide_start * 1000):010d}.jpg"
@@ -2521,24 +2893,41 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                                     video_id, video_path, slide_start, scene_chapters,
                                     scene["image"], image_cache, step,
                                 )
-                    if export_flags["include_section_clips"] and len(files["subparts"]) > 1:
+                    if export_flags["include_section_clips"]:
                         for subpart_index, subpart in enumerate(files["subparts"], start=1):
+                            if len(files["subparts"]) == 1 and chapter_videos:
+                                subpart["clip"] = clip_path
+                                subpart["clip_start"] = chapter["clip_start"]
+                                continue
                             section_end = (
                                 files["subparts"][subpart_index]["start"]
                                 if subpart_index < len(files["subparts"]) else chapter["end"]
                             )
-                            section_start = max(0.0, subpart["start"] - overlap_seconds)
-                            section_clip = temp_dir / f"{base_name}_{subpart_index:02d}.mp4"
+                            section_start = max(chapter["clip_start"], subpart["start"] - overlap_seconds)
+                            section_title = re.sub(r"[^A-Za-z0-9_-]+", "_", subpart["title"]).strip("_")[:60] or "Section"
+                            section_clip = temp_dir / f"{number:02d}_{subpart_index:02d}-{section_title}.mp4"
+                            if len(files["subparts"]) == 1:
+                                section_clip = clip_path
                             command = [
                                 media_executable("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
                                 "-ss", str(section_start), "-i", str(video_path),
                             ]
                             if section_end is not None:
                                 command.extend(["-t", str(max(0.1, section_end - section_start))])
-                            command.extend([*clip_stream_options, "-c:v", "libx264", "-c:a", "aac", str(section_clip)])
+                            command.extend([
+                                *clip_stream_options, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                                "-c:a", "aac", str(section_clip),
+                            ])
                             step(f"Part {number}/{len(chapter_data)}: encoding section {number}.{subpart_index} clip")
-                            subprocess.run(command, check=True)
+                            from ffmpeg_tools import encode_export_clip
+                            await encode_export_clip(
+                                command, step, f"Section {number}.{subpart_index}",
+                                section_end - section_start if section_end is not None else None,
+                            )
                             subpart["clip"] = section_clip
+                            subpart["clip_start"] = section_start
+                            if len(files["subparts"]) == 1:
+                                files["clip"] = section_clip
                 chaptered_lines.extend([
                     f"## Part {number}: {chapter['title']}",
                     f"Start: {format_chapter_timestamp(chapter['start'])}",
@@ -2574,11 +2963,21 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                 show_section_times = timestamp_mode != "part"
 
                 def seek_link(clip_index, clip_start, seconds, label, css_class="seek"):
+                    files = chapter_files[clip_index - 1]
+                    video_id = f"video-{clip_index}"
+                    path = files["clip"]
+                    if not chapter_videos and files.get("subparts"):
+                        selected = [(i, part) for i, part in enumerate(files["subparts"], 1)
+                                    if part["start"] <= seconds]
+                        part_index, part = selected[-1] if selected else (1, files["subparts"][0])
+                        path, clip_start = part["clip"], part["clip_start"]
+                        if len(files["subparts"]) > 1:
+                            video_id += f"-{part_index}"
                     offset = max(0.0, seconds - clip_start)
-                    clip = html.escape(chapter_files[clip_index - 1]["clip"].name, quote=True)
+                    clip = html.escape(path.name, quote=True)
                     return (
                         f"<a class=\"{css_class}\" href=\"{clip}#t={offset:.3f}\" "
-                        f"data-video=\"video-{clip_index}\" data-t=\"{offset:.3f}\">{label}</a>"
+                        f"data-video=\"{video_id}\" data-t=\"{offset:.3f}\">{label}</a>"
                     )
 
                 html_language = html.escape(transcript_language or ("ar" if export_rtl else "en"))
@@ -2609,8 +3008,8 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                     "img,video{max-width:100%;display:block}video{width:100%;border-radius:10px;background:#000;margin:1rem 0}"
                     ".chapter-summary{font-size:1.05rem;margin:.75rem 0}"
                     "figure{margin:0}.chapter-heading,.subpart-heading{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}"
-                    ".export-thumbnail{margin:.5rem 0;width:120px;flex-shrink:0}"
-                    ".export-thumbnail img{width:120px;height:68px;object-fit:contain;margin:0;cursor:zoom-in;border-radius:6px;border:1px solid var(--line)}"
+                    ".export-thumbnail{margin:.5rem 0;width:160px;max-width:100%;flex-shrink:0}"
+                    ".export-thumbnail img{width:160px;height:90px;object-fit:contain;margin:0;cursor:zoom-in;border-radius:6px;border:1px solid var(--line)}"
                     ".export-thumbnail figcaption{font-size:.78rem;color:var(--muted);overflow-wrap:anywhere;margin:.25rem 0}"
                     ".chapter-subparts{margin-block:1rem 0;margin-inline:1.5rem 0;padding-inline-start:1rem;border-inline-start:3px solid var(--line)}"
                     ".chapter-subparts>summary{font-weight:600;cursor:pointer;color:var(--brand)}"
@@ -2690,16 +3089,19 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                                 + "</ul>"
                             )
                         webpage_parts.append("</details>")
-                    webpage_parts.extend([
-                        f"<video id=\"video-{chapter['index']}\" controls preload=\"metadata\" src=\"{html.escape(clip_name)}\"></video>",
-                        "<details class=\"chapter-subparts\" open><summary>Sections</summary>",
-                    ])
+                    multiple_parts = len(files["subparts"]) > 1
+                    if chapter_videos or not multiple_parts:
+                        webpage_parts.append(
+                            f"<video id=\"video-{chapter['index']}\" controls preload=\"metadata\" src=\"{html.escape(clip_name)}\"></video>")
+                    if multiple_parts:
+                        webpage_parts.append("<details class=\"chapter-subparts\" open><summary>Sections</summary>")
                     for subpart_index, subpart in enumerate(files["subparts"], start=1):
                         subpart_timestamp = (
                             f" ({format_chapter_timestamp(subpart['start'])})"
                             if show_section_times else ""
                         )
-                        webpage_parts.append(
+                        if multiple_parts:
+                            webpage_parts.append(
                             f"<details class=\"subpart\" id=\"part-{chapter['index']}-{subpart_index}\">"
                             f"<summary><h3 title=\"{html.escape(subpart['title'], quote=True)}\">"
                             f"{chapter['index']}.{subpart_index} {html.escape(subpart['title'])}"
@@ -2712,10 +3114,11 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                         webpage_parts.append("<div class=\"subpart-heading\">")
                         for scene in subpart["slides"]:
                             webpage_parts.append(export_thumbnail(
-                                scene["image"].name, subpart["title"], f"{scene['image_index'] + 1}: ",
+                                scene["image"].name, scene["title"] if scene.get("title_edited") else subpart["title"],
+                                f"{scene['image_index'] + 1}: ",
                             ))
                         if not subpart["slides"]:
-                            webpage_parts.append(export_thumbnail(image_name, subpart["title"]))
+                            webpage_parts.append(export_thumbnail(subpart["image"].name, subpart["title"]))
                         webpage_parts.append("</div><p>")
                         webpage_parts.append(seek_link(
                             chapter["index"], chapter["clip_start"], subpart["start"],
@@ -2728,16 +3131,17 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                                 f"Slide {scene['image_index'] + 1}: {format_chapter_timestamp(slide_start)}",
                             ))
                         webpage_parts.append("</p>")
-                        if subpart.get("clip"):
+                        if subpart.get("clip") and multiple_parts:
                             webpage_parts.append(
-                                f"<video class=\"section-video\" controls preload=\"none\" "
+                                f"<video id=\"video-{chapter['index']}-{subpart_index}\" class=\"section-video\" controls preload=\"none\" "
                                 f"src=\"{html.escape(subpart['clip'].name, quote=True)}\"></video>"
                             )
                         webpage_parts.append(
                             "<details class=\"transcript\"><summary>Transcript</summary>"
-                            f"<pre>{html.escape(subpart['transcript'])}</pre></details></details>"
+                            f"<pre>{html.escape(subpart['transcript'])}</pre></details>"
+                            + ("</details>" if multiple_parts else "")
                         )
-                    webpage_parts.append("</details></section>")
+                    webpage_parts.append(("</details>" if multiple_parts else "") + "</section>")
                 webpage_parts.append(
                     "<script>document.addEventListener('click',function(event){"
                     "var link=event.target.closest('a[data-video]');if(!link)return;"
@@ -2766,11 +3170,12 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                             add_word_slide_content(outline_document, files["slide_content"], level=3)
                         if files["subparts"]:
                             for subpart_index, subpart in enumerate(files["subparts"], start=1):
-                                outline_document.add_heading(
-                                    f"{chapter['index']}.{subpart_index} {subpart['title']} "
-                                    f"({format_chapter_timestamp(subpart['start'])})",
-                                    level=3,
-                                )
+                                if len(files["subparts"]) > 1:
+                                    outline_document.add_heading(
+                                        f"{chapter['index']}.{subpart_index} {subpart['title']} "
+                                        f"({format_chapter_timestamp(subpart['start'])})",
+                                        level=3,
+                                    )
                                 for point in subpart["points"]:
                                     outline_document.add_paragraph(
                                         point["text"],
@@ -2850,12 +3255,14 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                 export_flags[name] for name in (
                     "include_word", "include_pdf", "include_webpage", "include_scorm",
                     "include_images", "include_transcripts", "include_clips", "include_section_clips",
+                    "include_screenshot_transcript",
                 )
             )
             no_extra_files = not any(
                 export_flags[name] for name in (
                     "include_images", "include_transcripts", "include_clips",
                     "include_webpage", "include_outline", "include_scorm", "include_section_clips",
+                    "include_screenshot_transcript",
                 )
             )
             if no_extra_files and (only_word or only_pdf):

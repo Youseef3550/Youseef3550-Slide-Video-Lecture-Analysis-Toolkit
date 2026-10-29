@@ -38,6 +38,7 @@ const state = { currentVideoId: 'video', currentTranscriptSource: 'translation:d
 const requests = [], errors = [], links = [], saves = [];
 const elapsedTimers = [];
 const context = vm.createContext({
+    startProcessButton: require('./process_button_stub.cjs'),
     startElapsedTimer: (container, elapsed = 0, running = true) => {
         const timer = {container, elapsed, running, stopped: false};
         elapsedTimers.push(timer);
@@ -45,6 +46,7 @@ const context = vm.createContext({
     },
     state, showError: message => errors.push(message), refreshSavedExports: async () => {},
     saveBlobToUserLocation: async (blob, filename, container) => saves.push({blob, filename, container}),
+    datedExportFilename: filename => filename,
     openOptionsDialog: dialog => dialog.show(),
     fetch: (url, options) => new Promise((resolve, reject) => requests.push({url, options, resolve, reject})),
     document: {getElementById: id => ids[id], body: element(),
@@ -241,7 +243,8 @@ const reply = (request, data) => request.resolve({ok: true, json: async () => da
         {id: 'old-complete', title: 'Captioned video - Old', status: 'complete'},
     ]});
     await runningRefresh;
-    assert.equal(ids.captionVideoProgress.children.length, 2, 'Only the active export is shown, not history');
+    assert.equal(ids.captionVideoProgress.children.length, 2, 'Progress is shown once; stopping uses the initiating button');
+    assert.equal(ids.exportCaptionedVideoBtn.disabled, false, 'The initiating button remains available to stop creation');
     assert.match(ids.captionVideoProgress.children[0].textContent, /42%/);
     assert.equal(ids.captionVideoProgress.children[1].value, 42);
     assert.equal(ids.captionVideoProgress.children[1].max, 100);
@@ -309,7 +312,7 @@ const reply = (request, data) => request.resolve({ok: true, json: async () => da
     const before = links.length;
     await context.saveBlobToUserLocation({mp4: true}, 'Lecture_EN caption.mp4', ids.captionStyleDialog);
     assert.equal(links.length, before + 1);
-    assert.equal(links.at(-1).download, 'Lecture_EN caption.mp4');
+    assert.equal(links.at(-1).download, context.datedExportFilename('Lecture_EN caption.mp4'));
     assert(ids.captionStyleDialog.children.includes(links.at(-1)));
     assert(links.at(-1).clicked && links.at(-1).removed);
     ids.transcriptDownloadDialog.show();
@@ -318,5 +321,26 @@ const reply = (request, data) => request.resolve({ok: true, json: async () => da
     assert.equal(ids.captionStyleDialog.open, true);
     assert.equal(ids.captionStyleDialog.modal, false, 'Side-panel dialogs must not make resize handles inert');
     assert.equal(ids.transcriptDownloadDialog.open, false, 'Opening options closes other side-panel dialogs');
-    console.log('PASS: selected transcript snapshot, sidecar downloads, saved jobs, races, and input guards');
+    const progressContainer = ids.captionVideoProgress;
+    const runningJob = {id: 'stop-job', status: 'running', steps: []};
+    context.renderCaptionJob(progressContainer, runningJob);
+    const stopButton = ids.exportCaptionedVideoBtn;
+    assert.equal(stopButton.disabled, false, 'The initiating button can stop a rediscovered running job');
+    let stopping = context.exportCaptionedVideo();
+    assert.equal(stopButton.disabled, true);
+    assert.equal(requests.at(-1).url, '/export_jobs/stop-job/cancel');
+    assert.equal(requests.at(-1).options.method, 'POST');
+    requests.at(-1).resolve({ok: false, json: async () => ({detail: 'Try again'})});
+    await stopping;
+    assert.equal(stopButton.disabled, false, 'Failed cancellation can be retried');
+    assert.match(progressContainer.children[0].textContent, /Could not stop/);
+    stopping = context.exportCaptionedVideo();
+    reply(requests.at(-1), {...runningJob, status: 'cancelled'});
+    await stopping;
+    assert.equal(progressContainer.children[0].textContent, 'Video creation stopped.');
+    assert.equal(progressContainer.children.some(child => child.textContent === 'Download MP4'), false);
+    assert.equal(progressContainer.children.some(child => child.textContent === 'Stop creating video'), false);
+    context.renderCaptionJob(progressContainer, {...runningJob, status: 'queued'});
+    assert.equal(stopButton.disabled, false, 'Queued jobs can also be stopped using the initiating button');
+    console.log('PASS: caption export, cancellation, saved jobs, races, and input guards');
 })().catch(error => { console.error(error); process.exitCode = 1; });

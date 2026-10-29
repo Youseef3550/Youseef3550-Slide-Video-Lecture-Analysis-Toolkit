@@ -4,6 +4,7 @@
 import { initApp } from './main.js';
 import { elements } from './elements.js';
 import { loadUploadedVideo } from './api-module.js';
+import { addSavedCaptionVariation } from './caption-export.js';
 
 // Example videos that have been pre-processed
 const exampleVideos = [
@@ -39,8 +40,8 @@ function initExampleVideos() {
         </select>
     `;
 
-    // Insert the container at the start of the input section
-    inputSection.insertBefore(container, inputSection.firstChild);
+    const versionContainer = document.getElementById('videoVersions').parentElement;
+    inputSection.insertBefore(container, versionContainer.nextSibling);
     initUploadedVideos(inputSection);
 
     // Add event listener for selection change
@@ -69,7 +70,7 @@ async function initUploadedVideos(inputSection) {
     const container = document.createElement('div');
     container.className = 'example-videos-container';
     container.innerHTML = '<select id="uploadedVideos" class="example-videos-select" title="Select a previously uploaded video"><option value="">Saved uploads ▾</option></select>';
-    inputSection.insertBefore(container, inputSection.firstChild);
+    inputSection.insertBefore(container, inputSection.querySelector('#extraOptionsMenu'));
     const select = container.querySelector('#uploadedVideos');
     try {
         const response = await fetch('/uploaded_videos');
@@ -81,6 +82,9 @@ async function initUploadedVideos(inputSection) {
             option.textContent = `${video.filename} (${(video.size_bytes / 1048576).toFixed(1)} MB)`;
             option.dataset.filename = video.filename;
             select.appendChild(option);
+            for (const variation of video.caption_variations || []) {
+                addSavedCaptionVariation(video.video_id, variation);
+            }
         });
         select.addEventListener('change', () => {
             if (select.value) loadUploadedVideo(select.value);

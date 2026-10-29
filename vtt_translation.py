@@ -85,84 +85,43 @@ def output_filename(filename, language, used):
     return name
 
 
-def grouped_vtt_segments(parsed):
-    """Share context and ID overhead across short fragments using protected boundaries."""
-    groups = []
-    current = []
-    size = 0
-    for segment in parsed["segments"]:
-        if current and (len(current) >= 8 or size + len(segment["text"]) > 1200):
-            groups.append(current)
-            current, size = [], 0
-        current.append(segment)
-        size += len(segment["text"])
-    if current:
-        groups.append(current)
-    segments, boundaries = [], []
-    source = "\n".join(segment["text"] for segment in parsed["segments"])
-    number = 0
-    for group in groups:
-        text = group[0]["text"]
-        markers = []
-        for item in group[1:]:
-            while f"[[VTT_{number}]]" in source:
-                number += 1
-            marker = f"[[VTT_{number}]]"
-            number += 1
-            markers.append(marker)
-            text += marker + item["text"]
-        start = group[0]["start"]
-        end = max(item["start"] + item["duration"] for item in group)
-        segments.append({"start": start, "duration": end - start, "text": text})
-        boundaries.append(markers)
-    return segments, boundaries
-
-
-def ungroup_vtt_segments(translated, boundaries):
-    if not isinstance(translated, list) or len(translated) != len(boundaries):
-        raise ValueError("Translation returned an incomplete VTT file.")
-    result = []
-    for item, markers in zip(translated, boundaries):
-        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
-            raise ValueError("Translation returned invalid caption text.")
-        text = item["text"]
-        parts = []
-        for marker in markers:
-            if text.count(marker) != 1:
-                raise ValueError("Translation changed protected VTT boundaries.")
-            value, text = text.split(marker, 1)
-            parts.append(value)
-        parts.append(text)
-        if any(not part.strip() for part in parts):
-            raise ValueError("Translation returned empty caption text.")
-        result.extend({"text": part} for part in parts)
-    return result
-
-
-async def translate_vtt_batch(files, target, model, processor, workspace, step, allow_fallback=True):
+async def translate_vtt_batch(
+    files, target, model, processor, workspace, step, allow_fallback=True, checkpoint_dir=None,
+):
     output = Path(workspace) / f"Translated_VTT_{target.upper()}.zip"
     used = set()
     reports = []
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for index, (filename, parsed) in enumerate(files, 1):
             step(f"File {index}/{len(files)}: {filename}")
-            segments, boundaries = grouped_vtt_segments(parsed)
+            segments = parsed["segments"]
             def progress(update):
                 step(f"File {index}/{len(files)}: {filename} - "
                      f"{update.get('message') or 'Translating'}")
             try:
-                result = await processor.translate_transcript(
-                    segments, target, model or None, on_progress=progress, allow_fallback=allow_fallback)
-                content = translated_vtt(parsed, ungroup_vtt_segments(result["transcript"], boundaries))
+                if checkpoint_dir is not None:
+                    from translation_checkpoint import translate_with_resume
+                    result = await translate_with_resume(
+                        processor, segments, target, model or None, checkpoint_dir=checkpoint_dir,
+                        on_progress=progress, allow_fallback=allow_fallback, clear_on_success=False,
+                    )
+                else:
+                    result = await processor.translate_transcript(
+                        segments, target, model or None, on_progress=progress, allow_fallback=allow_fallback)
+                content = translated_vtt(parsed, result["transcript"])
                 archive.writestr(output_filename(filename, target, used), content.encode("utf-8"))
                 reports.append({
                     "file": filename, "cue_count": parsed["cues"],
-                    "text_fragments": len(parsed["segments"]), "translation_groups": len(segments),
+                    "text_fragments": len(parsed["segments"]), "translation_items": len(segments),
                     **{key: result.get(key) for key in ("provider", "model", "usage", "elapsed_seconds")},
                 })
             except (RuntimeError, ValueError, KeyError) as error:
                 raise RuntimeError(f"Could not translate {filename}: {error}") from error
         archive.writestr("translation-report.json", json.dumps(reports, ensure_ascii=False, indent=2))
+    if checkpoint_dir is not None:
+        from translation_checkpoint import clear_translation_checkpoint
+        for _, parsed in files:
+            clear_translation_checkpoint(parsed["segments"], target, checkpoint_dir)
     models = sorted({model for report in reports for model in (
         (report.get("usage") or {}).get("models") or [f"{report.get('provider', 'Unknown')} {report.get('model', '')}"]
     )})
@@ -174,6 +133,12 @@ async def translate_vtt_batch(files, target, model, processor, workspace, step, 
     has_usage = any(usage["reported_requests"] for usage in usages)
     tokens = (f"{total:,} tokens ({input_tokens:,} input, {output_tokens:,} output)"
               + ("" if complete else "; partial usage, some requests unreported")) if has_usage else "Token usage unavailable"
+    character_requests = sum(usage.get("character_requests", 0) for usage in usages)
+    if character_requests:
+        submitted = sum(usage.get("submitted_characters", 0) for usage in usages)
+        translated = sum(usage.get("translated_characters", 0) for usage in usages)
+        characters = f"{submitted:,} characters submitted to translation services; {translated:,} successfully translated"
+        tokens = characters + (f"; {tokens}" if any(usage.get("llm_requests", 0) for usage in usages) else "; no LLM tokens used")
     step(f"Translation result: Models tried: {', '.join(models)}. {tokens}.")
     step(f"All {len(files)} VTT files translated; preparing ZIP")
     return FileResponse(output, media_type="application/zip", filename=output.name)

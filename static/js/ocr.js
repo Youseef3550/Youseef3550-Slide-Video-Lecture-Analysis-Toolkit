@@ -4,6 +4,7 @@ import { createSlideDownloadButton } from './slide-downloads.js';
 import { elements } from './elements.js';
 import { state } from './main.js';
 import { showNotification } from './ui.js';
+import { startProcessButton, finishProcessButton, formatElapsedTime } from './progress-time.js';
 
 // Store the SSE connection globally so it can be accessed from api.js
 window.sseConnection = null;
@@ -96,12 +97,12 @@ function handleSSEEvent(data, videoId) {
 }
 
 function formatElapsed(seconds) {
-    const total = Math.max(0, Math.round(Number(seconds) || 0));
-    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+    return formatElapsedTime(seconds);
 }
 
 let ocrStatusSnapshot = null;
 let ocrStatusTimer = null;
+let ocrButtonProgress = null;
 
 function ensureOcrStatusElement() {
     const container = elements.slideContentContainer;
@@ -118,9 +119,9 @@ function ensureOcrStatusElement() {
                     <i class="fas fa-spinner fa-spin" aria-hidden="true"></i>
                     <span class="ocr-progress-title"></span>
                     <span class="ocr-progress-elapsed"></span>
-                    <button type="button" id="stopOcrBtn" class="btn btn-danger">Stop OCR</button>
+                    <button type="button" id="stopOcrBtn" class="btn btn-secondary" aria-label="Stop reading slide text"></button>
                 </div>
-                <div class="ocr-progress-bar"><div class="ocr-progress-fill"></div></div>
+                <progress class="ocr-task-progress" max="100" aria-label="Slide text recognition progress"></progress>
                 <div class="ocr-progress-text"></div>
                 <div class="ocr-progress-detail"></div>
             </div>`;
@@ -178,9 +179,9 @@ export function renderOcrStatus(progressData) {
     panel.querySelector('.ocr-progress-title').textContent = titles[status] || 'OCR';
 
     const percent = Number(progressData.percent);
-    if (Number.isFinite(percent)) {
-        panel.querySelector('.ocr-progress-fill').style.width = `${Math.max(0, Math.min(100, percent))}%`;
-    }
+    const progress = panel.querySelector('.ocr-task-progress');
+    if (typeof progressData.percent === 'number' && Number.isFinite(percent)) progress.value = Math.max(0, Math.min(100, percent));
+    else progress.removeAttribute('value');
     if (progressData.message || progressData.error) {
         panel.querySelector('.ocr-progress-text').textContent = progressData.message || progressData.error;
     }
@@ -198,8 +199,12 @@ export function renderOcrStatus(progressData) {
 
     const stopButton = panel.querySelector('#stopOcrBtn');
     stopButton.hidden = !live;
-    stopButton.disabled = status === 'stopping';
-    stopButton.textContent = status === 'stopping' ? 'Stopping...' : 'Stop OCR';
+    if (live) {
+        ocrButtonProgress = startProcessButton(stopButton, 'Reading slide text',
+            {cancellable: true, elapsedSeconds: Number(progressData.elapsed_seconds) || 0});
+        ocrButtonProgress.update({stopping: status === 'stopping',
+            percent: typeof progressData.percent === 'number' ? percent : null});
+    } else { ocrButtonProgress?.(); ocrButtonProgress = null; }
 
     ocrStatusSnapshot = {
         status,
@@ -216,6 +221,8 @@ export function renderOcrStatus(progressData) {
 }
 
 export function resetOcrStatus() {
+    finishProcessButton(document.getElementById('stopOcrBtn'));
+    ocrButtonProgress = null;
     clearInterval(ocrStatusTimer);
     ocrStatusTimer = null;
     ocrStatusSnapshot = null;
@@ -226,8 +233,7 @@ export async function stopOcrProcessing(videoId) {
     if (!videoId) return;
     const button = document.getElementById('stopOcrBtn');
     if (button) {
-        button.disabled = true;
-        button.textContent = 'Stopping...';
+        ocrButtonProgress?.update({stopping: true});
     }
     try {
         const response = await fetch(`/stop_ocr/${encodeURIComponent(videoId)}`, { method: 'POST' });
@@ -241,8 +247,7 @@ export async function stopOcrProcessing(videoId) {
         }
     } catch (error) {
         if (button) {
-            button.disabled = false;
-            button.textContent = 'Stop OCR';
+            ocrButtonProgress?.update({stopping: false});
         }
         showNotification(`Could not stop OCR: ${error.message}`, 'error');
     }

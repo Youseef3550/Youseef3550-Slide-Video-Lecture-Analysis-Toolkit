@@ -1,8 +1,8 @@
 import { state } from './main.js';
 import { refreshSavedExports } from './chapters.js';
 import { showError } from './ui.js';
-import { saveBlobToUserLocation, openOptionsDialog } from './utils.js';
-import { startElapsedTimer } from './progress-time.js';
+import { saveBlobToUserLocation, openOptionsDialog, datedExportFilename } from './utils.js';
+import { startElapsedTimer, startProcessButton } from './progress-time.js';
 
 let submitting = false;
 let refreshGeneration = 0;
@@ -20,6 +20,7 @@ let previewUrl = null;
 let previewTimer = null;
 let switchingMedia = false;
 let visibleCopyTrack = null;
+const captionVariations = new Map();
 
 function selectedCaptionStyle() {
     return {
@@ -36,14 +37,42 @@ export function selectedMediaExportId(videoId) {
         && player.getAttribute('src') === `/caption_copy/${encodeURIComponent(videoId)}/${id}` ? id : null;
 }
 
+export function selectedCaptionTrackIndex() {
+    const player = document.querySelector('video');
+    const index = Array.from(player?.textTracks || [])
+        .filter(track => track.kind === 'subtitles' || track.kind === 'captions')
+        .findIndex(track => track.mode === 'showing');
+    return index < 0 ? null : index;
+}
+
 function clearCopyCaptions(player) {
-    player.querySelectorAll('track[data-caption-copy]').forEach(element => {
+    player.querySelectorAll('track[data-caption-copy], track[data-chapter-caption]').forEach(element => {
         // Chromium can keep drawing active cues from a detached, showing track.
         element.track.mode = 'disabled';
         element.default = false;
         element.remove();
     });
     visibleCopyTrack = null;
+}
+
+export async function loadProjectCaptionTracks(videoId, player) {
+    const response = await fetch(`/chapter_captions/${encodeURIComponent(videoId)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Could not load chapter captions.');
+    if (state.currentVideoId !== videoId) return;
+    clearCopyCaptions(player);
+    const chosen = Math.max(0, (data.tracks || []).findIndex(track => track.default));
+    for (const [index, item] of (data.tracks || []).entries()) {
+        const track = document.createElement('track');
+        track.kind = 'subtitles';
+        track.label = item.label;
+        track.srclang = ({eng: 'en', deu: 'de', ger: 'de', ara: 'ar', pol: 'pl'})[item.language] || item.language;
+        track.src = item.url;
+        track.dataset.chapterCaption = '';
+        track.default = index === chosen;
+        player.appendChild(track);
+        track.track.mode = index === chosen ? 'showing' : 'disabled';
+    }
 }
 
 function syncCaptionVisibility(player) {
@@ -58,7 +87,39 @@ function syncCaptionVisibility(player) {
     visibleCopyTrack = selected || null;
 }
 
-async function useVideoCopy(job = null) {
+export function addSavedCaptionVariation(videoId, job) {
+    const versions = captionVariations.get(videoId) || new Map();
+    versions.set(job.id, job);
+    captionVariations.set(videoId, versions);
+    if (state.currentVideoId === videoId) refreshVideoVersions();
+}
+
+export function refreshVideoVersions() {
+    const select = document.getElementById('videoVersions');
+    if (!select) return;
+    const videoId = state.currentVideoId;
+    select.replaceChildren();
+    const original = document.createElement('option');
+    original.value = '';
+    original.textContent = 'Original video';
+    select.appendChild(original);
+    for (const job of captionVariations.get(videoId)?.values() || []) {
+        const option = document.createElement('option');
+        option.value = job.id;
+        option.textContent = job.filename;
+        select.appendChild(option);
+    }
+    select.dataset.videoId = videoId || '';
+    select.value = selectedMediaExportId(videoId) || '';
+    select.disabled = !videoId || switchingMedia;
+}
+
+export function removeSavedCaptionVariation(jobId) {
+    for (const versions of captionVariations.values()) versions.delete(jobId);
+    refreshVideoVersions();
+}
+
+export async function useVideoCopy(job = null) {
     if (switchingMedia) return;
     const videoId = state.currentVideoId;
     const player = document.querySelector('video');
@@ -74,9 +135,8 @@ async function useVideoCopy(job = null) {
     const stopElapsed = startElapsedTimer(status);
     const previousSource = player.getAttribute('src');
     const at = player.currentTime;
-    const playbackRate = player.playbackRate;
     const wasPlaying = !player.paused;
-    const previousTracks = Array.from(player.querySelectorAll('track[data-caption-copy]'),
+    const previousTracks = Array.from(player.querySelectorAll('track[data-caption-copy], track[data-chapter-caption]'),
         element => ({element, mode: element.track.mode, default: element.default}));
     let sourceChanged = false;
     try {
@@ -121,12 +181,14 @@ async function useVideoCopy(job = null) {
         visibleCopyTrack = copyTracks[0] || null;
         copyTracks.forEach((track, index) => { track.mode = index === 0 ? 'showing' : 'disabled'; });
         syncCaptionVisibility(player);
+        if (!job) await loadProjectCaptionTracks(videoId, player);
         player.dataset.captionExportId = job?.id || '';
         player.dataset.captionVideoId = videoId;
         player.currentTime = Math.min(at, Math.max(0, player.duration - 0.1));
-        player.playbackRate = playbackRate;
         status.textContent = job ? `Editor source: ${job.filename}. Analysis kept.` : 'Editor source: original video.';
         if (wasPlaying) await player.play();
+        if (job) addSavedCaptionVariation(videoId, job);
+        return true;
     } catch (error) {
         if (videoId !== state.currentVideoId) return;
         if (sourceChanged && !selectedMediaExportId(videoId)) {
@@ -142,11 +204,13 @@ async function useVideoCopy(job = null) {
         }
         status.textContent = `Could not switch video: ${error.message}`;
         showError(status.textContent);
+        return false;
     } finally {
         stopElapsed();
         switchingMedia = false;
         button.disabled = false;
         updateSavedCaptionSelection();
+        refreshVideoVersions();
     }
 }
 
@@ -250,11 +314,13 @@ async function readResponse(response) {
 function renderCaptionJob(container, job) {
     if (!job) {
         renderedJobs.get(container)?.stopElapsed();
+        renderedJobs.get(container)?.finishButton?.();
         renderedJobs.delete(container);
         container.replaceChildren();
         return;
     }
     const text = job.status === 'complete' ? 'Your video copy is ready.'
+        : job.status === 'cancelled' ? 'Video creation stopped.'
         : job.status === 'error' ? `Export failed: ${job.error}`
         : job.steps?.at(-1)?.message || 'Preparing video copy...';
     const encoded = job.steps?.findLast(step => /(?:Burning captions|Adding caption tracks): \d+%/.test(step.message));
@@ -263,20 +329,25 @@ function renderCaptionJob(container, job) {
     if (rendered?.id === job.id && rendered.status === job.status && container.children[0] === rendered.message) {
         if (rendered.message.textContent !== text) rendered.message.textContent = text;
         if (rendered.progress && percent !== null) rendered.progress.value = percent;
+        rendered.finishButton?.update({percent});
         return;
     }
     rendered?.stopElapsed();
+    rendered?.finishButton?.();
     container.replaceChildren();
     const message = document.createElement('p');
     message.textContent = text;
     container.append(message);
-    let progress;
+    let progress, finishButton;
     if (job.status === 'queued' || job.status === 'running') {
         progress = document.createElement('progress');
         progress.max = 100;
         progress.setAttribute('aria-label', 'Captioned video generation progress');
         if (percent !== null) progress.value = percent;
         container.append(progress);
+        finishButton = startProcessButton(document.getElementById('exportCaptionedVideoBtn'), 'Creating video copy',
+            {cancellable: true, elapsedSeconds: job.elapsed || 0});
+        finishButton.update({percent});
     } else if (job.status === 'complete') {
         const button = document.createElement('button');
         button.type = 'button';
@@ -294,7 +365,7 @@ function renderCaptionJob(container, job) {
     const elapsed = Number.isFinite(job.elapsed) ? job.elapsed
         : job.created_at ? ((job.finished_at || Date.now() / 1000) - job.created_at) : 0;
     const stopElapsed = startElapsedTimer(container, elapsed, job.status === 'queued' || job.status === 'running');
-    renderedJobs.set(container, {id: job.id, status: job.status, message, progress, stopElapsed});
+    renderedJobs.set(container, {id: job.id, status: job.status, message, progress, stopElapsed, finishButton});
 }
 
 async function downloadCaptionVideo(job, button, status) {
@@ -313,7 +384,7 @@ async function downloadCaptionVideo(job, button, status) {
         const blob = await response.blob();
         const container = Array.from(document.querySelectorAll('dialog:modal')).at(-1) || document.body;
         await saveBlobToUserLocation(blob, job.filename, container);
-        status.textContent = 'Video copy sent to your save dialog or browser downloads.';
+        status.textContent = 'Video copy sent to browser downloads.';
     } catch (error) {
         status.textContent = error.name === 'AbortError' ? 'Save cancelled.' : `Could not download video copy: ${error.message}`;
         if (error.name !== 'AbortError') showError(status.textContent);
@@ -355,6 +426,8 @@ export async function refreshSavedCaptionVideos() {
         const selected = select.value;
         savedCaptionVideos = data.exports.filter(job => job.video_id === videoId && job.title.startsWith('Captioned video - '));
         const completed = savedCaptionVideos.filter(job => job.status === 'complete');
+        captionVariations.set(videoId, new Map(completed.map(job => [job.id, job])));
+        refreshVideoVersions();
         const optionsKey = JSON.stringify(completed.map(job => [job.id, job.filename, job.title, job.created_at]));
         if (optionsKey !== savedCaptionOptionsKey) {
             select.replaceChildren();
@@ -426,6 +499,19 @@ export async function refreshCaptionExports() {
 
 export async function exportCaptionedVideo() {
     if (submitting) return;
+    const active = renderedJobs.get(document.getElementById('captionVideoProgress'));
+    if (active && ['queued', 'running'].includes(active.status)) {
+        active.finishButton?.update({stopping: true});
+        try {
+            const result = await readResponse(await fetch(`/export_jobs/${encodeURIComponent(active.id)}/cancel`, {method: 'POST'}));
+            renderCaptionJob(document.getElementById('captionVideoProgress'), result);
+        } catch (error) {
+            active.finishButton?.update({stopping: false});
+            active.message.textContent = `Could not stop video creation: ${error.message}`;
+            showError(`Could not stop video creation: ${error.message}`);
+        }
+        return;
+    }
     const selectable = document.getElementById('captionExportMode')?.value === 'tracks';
     const versionIds = Array.from(document.getElementById('captionTrackVersions')?.selectedOptions || [], item => item.value);
     if (selectable && !versionIds.length) {
@@ -453,6 +539,7 @@ export async function exportCaptionedVideo() {
     progressVideoId = videoId;
     progress.textContent = 'Starting video copy...';
     const stopElapsed = startElapsedTimer(progress);
+    const stopButtonElapsed = startProcessButton(button, 'Starting video copy');
     try {
         const result = await readResponse(await fetch(`/${selectable ? 'caption_track_jobs' : 'caption_video_jobs'}/${encodeURIComponent(videoId)}`, {
             method: 'POST',
@@ -474,6 +561,7 @@ export async function exportCaptionedVideo() {
         }
     } finally {
         stopElapsed();
+        stopButtonElapsed();
         submitting = false;
         button.disabled = false;
     }
@@ -489,7 +577,7 @@ export async function downloadCaptionFile(format) {
     const filename = (state.currentVideoFilename || 'video').replace(/\.[^.]+$/, '');
     const transcript = state.currentTranscript.map(item => ({ start: item.start, duration: item.duration, text: item.text }));
     button.disabled = true;
-    const stopElapsed = startElapsedTimer(button);
+    const stopElapsed = startProcessButton(button, 'Downloading captions');
     try {
         const response = await fetch(`/caption_file/${encodeURIComponent(videoId)}/${format}`, {
             method: 'POST',
@@ -503,7 +591,7 @@ export async function downloadCaptionFile(format) {
         const url = URL.createObjectURL(await response.blob());
         const link = document.createElement('a');
         link.href = url;
-        link.download = `${filename}.${format}`;
+        link.download = datedExportFilename(`${filename}.${format}`);
         const dialog = document.getElementById('transcriptDownloadDialog');
         (dialog?.open ? dialog : document.body).append(link);
         link.click();
@@ -518,6 +606,14 @@ export async function downloadCaptionFile(format) {
 }
 
 export function initCaptionExport() {
+    document.getElementById('videoVersions')?.addEventListener('change', async event => {
+        const select = event.currentTarget;
+        if (select.dataset.videoId !== state.currentVideoId) return;
+        select.disabled = true;
+        await useVideoCopy(select.value ? {id: select.value} : null);
+        refreshVideoVersions();
+    });
+    document.addEventListener('videoSelectionChanged', refreshVideoVersions);
     const player = document.querySelector('video');
     player?.textTracks?.addEventListener('change', () => syncCaptionVisibility(player));
     player?.addEventListener('loadstart', () => {

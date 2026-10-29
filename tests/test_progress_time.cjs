@@ -33,6 +33,8 @@ for (const [value, expected] of [[0, '0:00'], [59.9, '0:59'], [60, '1:00'],
 }
 const stop = context.startElapsedTimer(container, 58);
 assert.equal(container.children[0].textContent, '0:58 elapsed');
+assert.equal(container.children[0].className, 'progress-elapsed is-running',
+    'Only live timers mark their progress container as running');
 const label = container.children[0];
 tick(3);
 assert.equal(label.textContent, '1:01 elapsed', 'Uses actual time even if interval callbacks are delayed');
@@ -45,6 +47,8 @@ stop();
 assert.equal(container.children.length, 1, 'An old operation cannot remove the new clock');
 assert.equal(intervals.size, 1);
 context.startElapsedTimer(container, 130, false);
+assert.equal(container.children[0].className, 'progress-elapsed',
+    'Completed and failed jobs must not keep the running highlight');
 tick(9);
 assert.equal(container.children[0].textContent, '2:10 elapsed', 'Finished jobs retain their final time');
 assert.equal(intervals.size, 0, 'Finished jobs have no active interval');

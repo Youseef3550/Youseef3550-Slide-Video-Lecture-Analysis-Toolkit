@@ -1,8 +1,12 @@
 import asyncio
+import ast
 import json
+import math
+import re
 import sys
 import unittest
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 from types import ModuleType
@@ -24,6 +28,8 @@ google_module = ModuleType("google")
 google_genai_module = ModuleType("google.genai")
 google_genai_types_module = ModuleType("google.genai.types")
 google_genai_types_module.GenerateContentConfig = lambda **kwargs: kwargs
+google_genai_types_module.HttpOptions = lambda **kwargs: SimpleNamespace(**kwargs)
+google_genai_types_module.HttpRetryOptions = lambda **kwargs: SimpleNamespace(**kwargs)
 google_genai_module.types = google_genai_types_module
 google_genai_module.Client = object
 google_module.genai = google_genai_module
@@ -67,6 +73,118 @@ class CompleteFakeGeminiModels:
 
 
 class SummaryProcessorTranslationTests(unittest.TestCase):
+    def test_unchanged_output_is_not_retained_as_resumable_translation(self):
+        from translation_checkpoint import translate_with_resume
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._complete = lambda provider, model, prompt, *args: json.dumps({
+            "translations": json.loads(prompt.split("\n", 1)[1])["lines"],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "original text unchanged"):
+                asyncio.run(translate_with_resume(
+                    processor, [{"start": 0, "text": "Hello"}], "de", "gemini-test",
+                    checkpoint_dir=directory, allow_fallback=False,
+                ))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_failed_translation_resumes_real_engine_without_resubmitting_completed_lines(self):
+        from translation_checkpoint import translate_with_resume
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        calls = []
+        fail = True
+        def complete(provider, model, prompt, *args):
+            lines = json.loads(prompt.split("\n", 1)[1])["lines"]
+            calls.append([line["id"] for line in lines])
+            if fail and lines[0]["id"] == "segment-1":
+                raise RuntimeError("429 daily quota")
+            return json.dumps({"translations": [
+                {"id": line["id"], "text": "translated " + line["text"]} for line in lines]})
+        processor._complete = complete
+        transcript = [{"start": index, "text": "x" * 4000} for index in range(3)]
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "1/3 lines are saved"):
+                asyncio.run(translate_with_resume(
+                    processor, transcript, "de", "gemini-test", checkpoint_dir=directory,
+                    allow_fallback=False,
+                ))
+            self.assertEqual(calls, [["segment-0"], ["segment-1"]])
+            calls.clear()
+            fail = False
+            result = asyncio.run(translate_with_resume(
+                processor, transcript, "de", "gemini-test", checkpoint_dir=directory,
+                allow_fallback=False,
+            ))
+            self.assertEqual(calls, [["segment-1"], ["segment-2"]])
+            self.assertEqual(result["resumed_segments"], 1)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_gemini_minute_limit_retries_same_request_with_requested_wait(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._complete = mock.Mock(side_effect=[
+            RuntimeError("429 RESOURCE_EXHAUSTED GenerateRequestsPerMinutePerProject-FreeTier "
+                         "limit: 15 Please retry in 24.973435797s."),
+            '{"translations":[{"id":"segment-0","text":"Hallo"}]}',
+        ])
+        with mock.patch("processors.summary_processor.asyncio.sleep", new=mock.AsyncMock()) as sleep:
+            result = asyncio.run(processor.translate_transcript(
+                [{"start": 0, "text": "Hello"}], "de", "gemini-test", allow_fallback=False,
+            ))
+        sleep.assert_awaited_once_with(25.973435797)
+        self.assertEqual(processor._complete.call_args_list[0], processor._complete.call_args_list[1])
+        self.assertEqual(result["transcript"][0]["text"], "Hallo")
+
+    def test_gemini_minute_limit_is_bounded_and_falls_back_with_completed_fragments(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._provider_chain = lambda *args, **kwargs: [
+            ("gemini", "gemini-test"), ("openai", "gpt-test")]
+        calls = []
+        def complete(provider, model, prompt, *args):
+            lines = json.loads(prompt.split("\n", 1)[1])["lines"]
+            calls.append((provider, [item["id"] for item in lines]))
+            if provider == "gemini" and lines[0]["id"] != "segment-0":
+                raise RuntimeError("429 RESOURCE_EXHAUSTED requests per minute. Please retry in 25s")
+            return json.dumps({"translations": [
+                {"id": item["id"], "text": "translated " + item["text"]} for item in lines]})
+        processor._complete = complete
+        transcript = [{"start": index, "text": "x" * 4000} for index in range(3)]
+        with mock.patch("processors.summary_processor.asyncio.sleep", new=mock.AsyncMock()) as sleep:
+            result = asyncio.run(processor.translate_transcript(transcript, "de"))
+        self.assertEqual(sleep.await_count, 2)
+        self.assertEqual(calls, [
+            ("gemini", ["segment-0"]), ("gemini", ["segment-1"]),
+            ("gemini", ["segment-1"]), ("gemini", ["segment-1"]),
+            ("openai", ["segment-1"]), ("openai", ["segment-2"]),
+        ])
+        self.assertEqual(len(result["transcript"]), 3)
+        remaining_cooldown = processor.quota_exhausted_until[("gemini", "gemini-test")] - time.time()
+        self.assertGreater(remaining_cooldown, 20)
+        self.assertLessEqual(remaining_cooldown, 26)
+
+    def test_gemini_retry_rejects_daily_zero_unknown_and_long_quotas(self):
+        for message in (
+            "429 RequestsPerDay Please retry in 25s",
+            "429 RequestsPerMinute RequestsPerDay Please retry in 25s",
+            "429 requests per minute daily quota Please retry in 25s",
+            "429 requests per minute limit: 0 Please retry in 25s",
+            "429 requests per minute 'quotaValue': '0' Please retry in 25s",
+            "429 requests per minute Please retry in 100s",
+            "429 requests per minute",
+            "429 quota exhausted Please retry in 25s",
+            "503 requests per minute Please retry in 25s",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(SummaryProcessor._gemini_translation_retry_delay(RuntimeError(message)))
+        self.assertEqual(SummaryProcessor._gemini_translation_retry_delay(
+            RuntimeError("429 TokensPerMinute 'retryDelay': '24s'")), 25)
+
+    def test_translation_catalog_excludes_unavailable_groq_llama(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor.groq_client = object()
+        options = {item["id"]: item["available"] for item in processor.translation_models()}
+        self.assertNotIn("groq:llama-3.3-70b-versatile", options)
+        self.assertTrue(options["groq:openai/gpt-oss-20b"])
+        self.assertTrue(options["groq:openai/gpt-oss-120b"])
+
     def _gemini_processor(self, models):
         processor = SummaryProcessor.__new__(SummaryProcessor)
         processor.client = SimpleNamespace(models=models)
@@ -112,6 +230,207 @@ class SummaryProcessorTranslationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Choose a model"):
             asyncio.run(processor.translate_transcript([], "de", allow_fallback=False))
 
+    def test_quota_overload_and_timeout_switch_once_without_retry_waits(self):
+        for error in (RuntimeError("429 Rate limit: try again in 1m5s"),
+                      RuntimeError("503 UNAVAILABLE high demand"),
+                      asyncio.TimeoutError(),
+                      RuntimeError("Request timed out")):
+            with self.subTest(error=type(error).__name__, message=str(error)):
+                processor = self._gemini_processor(CompleteFakeGeminiModels())
+                processor._provider_chain = lambda *args, **kwargs: [
+                    ("groq", "llama-3.3-70b-versatile"), ("gemini", "gemini-test")]
+                def complete(provider, model, prompt, *args):
+                    if provider == "groq":
+                        raise error
+                    payload = json.loads(prompt.split("\n", 1)[1])
+                    return json.dumps({"translations": [
+                        {"id": item["id"], "text": "Hallo"} for item in payload["lines"]]})
+                processor._complete = mock.Mock(side_effect=complete)
+                with mock.patch("processors.summary_processor.asyncio.sleep", new=mock.AsyncMock()) as sleep:
+                    result = asyncio.run(processor.translate_transcript(
+                        [{"start": 0, "duration": 1, "text": "Hello"}], "de",
+                        "groq:llama-3.3-70b-versatile"))
+                    sleep.assert_not_awaited()
+                self.assertEqual(processor._complete.call_count, 2)
+                self.assertEqual(result["usage"]["requests"], 2)
+                self.assertEqual(result["provider"], "Gemini fallback")
+                if isinstance(error, asyncio.TimeoutError):
+                    self.assertIn("timed out after 30s", result["fallback_reason"])
+
+    def test_explicit_groq_strict_mode_stops_at_first_rate_limit(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._provider_chain = lambda *args, **kwargs: [
+            ("groq", "llama-3.3-70b-versatile"), ("gemini", "gemini-test")]
+        processor._complete = mock.Mock(side_effect=RuntimeError("429 Rate limit reached"))
+        with mock.patch("processors.summary_processor.asyncio.sleep", new=mock.AsyncMock()) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "after 1 attempt.*429"):
+                asyncio.run(processor.translate_transcript(
+                    [{"start": 0, "duration": 1, "text": "Hello"}], "de",
+                    "groq:llama-3.3-70b-versatile", allow_fallback=False))
+            sleep.assert_not_awaited()
+        processor._complete.assert_called_once()
+        self.assertEqual(processor._complete.call_args.args[0], "groq")
+
+    def test_short_groq_token_wait_retries_missing_lines_on_same_model(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._provider_chain = lambda *args, **kwargs: [
+            ("groq", "openai/gpt-oss-20b"), ("gemini", "gemini-test")]
+        processor._complete = mock.Mock(side_effect=[
+            '{"translations":[{"id":"segment-0","text":"Hallo"}]}',
+            RuntimeError("429 tokens per minute (TPM): Please try again in 5.3325s. rate_limit_exceeded"),
+            '{"translations":[{"id":"segment-1","text":"Welt"}]}',
+        ])
+        progress = []
+        with mock.patch("processors.summary_processor.asyncio.sleep", new=mock.AsyncMock()) as sleep:
+            result = asyncio.run(processor.translate_transcript([
+                {"start": 0, "duration": 1, "text": "Hello"},
+                {"start": 1, "duration": 1, "text": "World"}], "de",
+                "groq:openai/gpt-oss-20b", allow_fallback=False, on_progress=progress.append))
+            sleep.assert_awaited_once_with(6.3325)
+        calls = processor._complete.call_args_list
+        self.assertTrue(all(call.args[:2] == ("groq", "openai/gpt-oss-20b") for call in calls))
+        self.assertEqual(calls[1].args[2], calls[2].args[2], "Retry the exact missing-line request")
+        self.assertEqual([item["text"] for item in result["transcript"]], ["Hallo", "Welt"])
+        self.assertEqual(result["usage"]["requests"], 3)
+        self.assertTrue(any("once in 6.3s" in update["message"] for update in progress))
+
+    def test_short_groq_rate_limit_is_retried_only_once(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._provider_chain = lambda *args, **kwargs: [("groq", "openai/gpt-oss-20b")]
+        processor._complete = mock.Mock(side_effect=RuntimeError(
+            "429 tokens per minute: Please try again in 5.3325s. rate_limit_exceeded"))
+        with mock.patch("processors.summary_processor.asyncio.sleep", new=mock.AsyncMock()) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "after 2 attempt.*429"):
+                asyncio.run(processor.translate_transcript(
+                    [{"start": 0, "duration": 1, "text": "Hello"}], "de",
+                    "groq:openai/gpt-oss-20b", allow_fallback=False))
+            sleep.assert_awaited_once_with(6.3325)
+        self.assertEqual(processor._complete.call_count, 2)
+
+    def test_invalid_json_splits_requests_and_preserves_caption_fields(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._provider_chain = lambda *args, **kwargs: [("groq", "openai/gpt-oss-20b")]
+        calls = []
+        def complete(provider, model, prompt, *args):
+            lines = json.loads(prompt.split("\n", 1)[1])["lines"]
+            calls.append([item["id"] for item in lines])
+            if len(lines) > 2:
+                return '{"translations":[{"id":'
+            return "```json\n" + json.dumps({"translations": [
+                {"id": item["id"], "text": "Translated " + item["text"]} for item in lines]}) + "\n```"
+        processor._complete = complete
+        transcript = [{"start": index, "duration": 1, "text": f"Line {index}", "speaker": "A"}
+                      for index in range(8)]
+        progress = []
+        result = asyncio.run(processor.translate_transcript(
+            transcript, "de", "groq:openai/gpt-oss-20b",
+            allow_fallback=False, on_progress=progress.append))
+        self.assertEqual([len(call) for call in calls], [8, 4, 2, 2, 4, 2, 2])
+        self.assertEqual(result["usage"]["requests"], 7)
+        self.assertEqual(len(result["transcript"]), 8)
+        for original, translated in zip(transcript, result["transcript"]):
+            self.assertEqual(translated, {**original, "text": "Translated " + original["text"]})
+        self.assertTrue(any("two smaller requests" in update["message"] for update in progress))
+
+    def test_persistent_invalid_json_recovery_is_bounded(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._complete = mock.Mock(return_value='{"translations":[')
+        with self.assertRaisesRegex(ValueError, "invalid JSON after bounded recovery"):
+            asyncio.run(processor.translate_transcript(
+                [{"start": index, "duration": 1, "text": f"Line {index}"} for index in range(8)],
+                "de", "gemini-test", allow_fallback=False))
+        self.assertEqual(processor._complete.call_count, 3)
+
+    def test_invalid_response_shape_recovers_in_smaller_requests(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._complete = mock.Mock(side_effect=[
+            '{"translations":null}',
+            '{"translations":[{"id":"segment-0","text":"Hallo"}]}',
+            '{"translations":[{"id":"segment-1","text":"Welt"}]}',
+        ])
+        result = asyncio.run(processor.translate_transcript([
+            {"start": 0, "duration": 1, "text": "Hello"},
+            {"start": 1, "duration": 1, "text": "World"}], "de", "gemini-test",
+            allow_fallback=False))
+        self.assertEqual([item["text"] for item in result["transcript"]], ["Hallo", "Welt"])
+        self.assertEqual(result["usage"]["requests"], 3)
+
+    def test_successful_split_is_kept_when_next_split_hits_quota(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._provider_chain = lambda *args, **kwargs: [
+            ("groq", "openai/gpt-oss-20b"), ("gemini", "gemini-test")]
+        calls = []
+        def complete(provider, model, prompt, *args):
+            lines = json.loads(prompt.split("\n", 1)[1])["lines"]
+            calls.append((provider, [item["id"] for item in lines]))
+            if provider == "groq":
+                if len(lines) > 1:
+                    return "malformed"
+                if lines[0]["id"] == "segment-1":
+                    raise RuntimeError("429 rate limit")
+            return json.dumps({"translations": [
+                {"id": item["id"], "text": "Translated " + item["text"]} for item in lines]})
+        processor._complete = complete
+        result = asyncio.run(processor.translate_transcript([
+            {"start": 0, "duration": 1, "text": "Hello"},
+            {"start": 1, "duration": 1, "text": "World"}], "de", "groq:openai/gpt-oss-20b"))
+        self.assertEqual(calls[-1], ("gemini", ["segment-1"]))
+        self.assertEqual(len(result["transcript"]), 2)
+
+    def test_short_wait_policy_rejects_long_unknown_and_daily_quota_errors(self):
+        for message in (
+            "429 tokens per minute: try again in 1m5s",
+            "429 tokens per minute: try again in 14.1s",
+            "429 tokens per minute: try again in 65s",
+            "429 tokens per minute: no retry time provided",
+            "429 daily quota: try again in 5s",
+            "503 UNAVAILABLE: try again in 5s",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(SummaryProcessor._short_translation_retry_delay(RuntimeError(message)))
+        self.assertEqual(SummaryProcessor._short_translation_retry_delay(
+            RuntimeError("429 rate_limit_exceeded: try again in 14s")), 15)
+
+    def test_partial_batch_success_survives_failed_missing_line_retry(self):
+        processor = self._gemini_processor(CompleteFakeGeminiModels())
+        processor._provider_chain = lambda *args, **kwargs: [
+            ("groq", "llama-3.3-70b-versatile"), ("gemini", "gemini-test")]
+        calls = []
+        def complete(provider, model, prompt, *args):
+            payload = json.loads(prompt.split("\n", 1)[1])
+            lines = payload["lines"]
+            calls.append((provider, [item["id"] for item in lines]))
+            if provider == "groq":
+                if len(calls) == 1:
+                    return '{"translations":[{"id":"segment-0","text":"Hallo"}]}'
+                raise RuntimeError("429 Rate limit")
+            return json.dumps({"translations": [{"id": item["id"], "text": "Welt"} for item in lines]})
+        processor._complete = complete
+        result = asyncio.run(processor.translate_transcript([
+            {"start": 0, "duration": 1, "text": "Hello"},
+            {"start": 1, "duration": 1, "text": "World"}], "de",
+            "groq:llama-3.3-70b-versatile"))
+        self.assertEqual(calls, [
+            ("groq", ["segment-0", "segment-1"]),
+            ("groq", ["segment-1"]), ("gemini", ["segment-1"])])
+        self.assertEqual([item["text"] for item in result["transcript"]], ["Hallo", "Welt"])
+        self.assertEqual(result["usage"]["requests"], 3)
+
+    def test_gemini_translation_bounds_sdk_requests_without_changing_chapters(self):
+        models = CompleteFakeGeminiModels()
+        models.generate_content = mock.Mock(wraps=models.generate_content)
+        processor = self._gemini_processor(models)
+        asyncio.run(processor.translate_transcript(
+            [{"start": 0, "duration": 1, "text": "Hello"}], "de", "gemini-test"))
+        config = models.generate_content.call_args.kwargs["config"]
+        options = config["http_options"] if isinstance(config, dict) else config.http_options
+        self.assertEqual(options.timeout, 30000)
+        self.assertEqual(options.retry_options.attempts, 1)
+        processor._complete("gemini", "gemini-test",
+                            'Translate\n{"lines":[{"id":"test","text":"Hello"}]}', 0.2)
+        config = models.generate_content.call_args.kwargs["config"]
+        self.assertFalse(config.get("http_options") if isinstance(config, dict) else config.http_options)
+
     def test_groq_default_and_usage_are_retained_across_provider_fallback(self):
         class Completions:
             def create(self, **kwargs):
@@ -125,9 +444,11 @@ class SummaryProcessorTranslationTests(unittest.TestCase):
                 )
         processor = self._gemini_processor(CompleteFakeGeminiModels())
         processor.groq_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        processor.groq_client.with_options = mock.Mock(return_value=processor.groq_client)
         processor.groq_model_name = "openai/gpt-oss-120b"
         transcript = [{"start": 0, "duration": 1, "text": "Hello"}]
         result = asyncio.run(processor.translate_transcript(transcript, "de"))
+        processor.groq_client.with_options.assert_called_once_with(timeout=30, max_retries=0)
         self.assertEqual(result["provider"], "Groq")
         self.assertEqual(result["usage"]["total_tokens"], 100)
         self.assertTrue(result["usage"]["complete"])
@@ -138,19 +459,38 @@ class SummaryProcessorTranslationTests(unittest.TestCase):
         self.assertEqual(fallback["usage"]["models"], ["Gemini gemini-test", "Groq openai/gpt-oss-120b"])
         self.assertFalse(fallback["usage"]["complete"])
 
-    def test_changed_vtt_markers_retry_only_invalid_group(self):
-        class MarkedModels(CompleteFakeGeminiModels):
+    def test_persistent_omissions_retry_only_unresolved_plain_fragment(self):
+        class MissingFragment(CompleteFakeGeminiModels):
             def generate_content(self, **kwargs):
                 response = super().generate_content(**kwargs)
-                if len(self.payloads) == 1:
-                    response.text = response.text.replace("[[VTT_0]]", "[[VTT_9]]")
+                if len(self.payloads) < 3:
+                    result = json.loads(response.text)
+                    result["translations"] = [item for item in result["translations"] if item["id"] != "segment-0"]
+                    response.text = json.dumps(result)
                 return response
-        models = MarkedModels()
+        models = MissingFragment()
+        progress = []
         result = asyncio.run(self._gemini_processor(models).translate_transcript(
-            [{"start": 0, "duration": 2, "text": "Hello[[VTT_0]]World"},
-             {"start": 2, "duration": 1, "text": "Other"}], "de", "gemini-test"))
-        self.assertIn("[[VTT_0]]", result["transcript"][0]["text"])
-        self.assertEqual([item["id"] for item in models.payloads[1]["lines"]], ["segment-0"])
+            [{"start": 0, "duration": 3, "text": "Hello"},
+             {"start": 3, "duration": 1, "text": "Other"}], "de", "gemini-test",
+            on_progress=progress.append))
+        self.assertEqual(result["transcript"][0]["text"], "translated: Hello")
+        self.assertEqual(result["transcript"][1]["text"], "translated: Other")
+        self.assertEqual(len(models.payloads), 3)
+        self.assertEqual([payload["lines"][0]["text"] for payload in models.payloads[2:]],
+                         ["Hello"])
+        self.assertTrue(all(len(payload["lines"]) == 1 for payload in models.payloads[2:]))
+        self.assertEqual(result["usage"]["requests"], 3)
+        self.assertTrue(any("separately" in update["message"] for update in progress))
+
+    def test_individual_fragment_omissions_remain_explicit_errors(self):
+        class EmptyModels:
+            def generate_content(self, **kwargs):
+                return SimpleNamespace(text='{"translations":[]}')
+        with self.assertRaisesRegex(RuntimeError, "even when requested individually"):
+            asyncio.run(self._gemini_processor(EmptyModels()).translate_transcript(
+                [{"start": 0, "duration": 1, "text": "Hello"}],
+                "de", "gemini-test"))
 
     def test_translation_retries_only_missing_ids_and_preserves_fields(self):
         processor = SummaryProcessor.__new__(SummaryProcessor)
@@ -243,6 +583,7 @@ class SummaryProcessorTranslationTests(unittest.TestCase):
         processor.openai_client = SimpleNamespace(
             chat=SimpleNamespace(completions=FakeOpenAICompletions())
         )
+        processor.openai_client.with_options = mock.Mock(return_value=processor.openai_client)
         processor.openai_model_name = "gpt-test"
         processor._refresh_gemini_client = lambda: None
         processor._refresh_openai_client = lambda: None
@@ -353,6 +694,189 @@ class SummaryProcessorTranslationTests(unittest.TestCase):
 
 
 class SummaryProviderFallbackTests(unittest.TestCase):
+    def test_same_slide_chapter_splits_become_sections_without_losing_text(self):
+        chapters = [
+            {"timestamp": "00:00", "title": "Introduction", "summary": "First summary"},
+            {"timestamp": "00:20", "title": "Example", "summary": "Example summary",
+             "sections": [{"timestamp": "00:20", "title": "Example detail", "point": "Preserved"}]},
+            {"timestamp": "01:00", "title": "New slide", "summary": "New subject"},
+            {"timestamp": "01:30", "title": "Continuation", "summary": "More details"},
+        ]
+        result = SummaryProcessor._respect_slide_chapters(chapters, [0, 60, 120])
+        self.assertEqual([chapter["timestamp"] for chapter in result], ["00:00", "01:00"])
+        self.assertEqual([section["timestamp"] for section in result[0]["sections"]], ["00:00", "00:20"])
+        self.assertIn("Preserved", result[0]["sections"][1]["point"])
+        self.assertIn("Example summary", result[0]["summary"])
+        self.assertEqual(result[1]["sections"][1]["title"], "Continuation")
+        self.assertEqual(len(chapters), 4, "Generation must not mutate source chapters")
+        flat = SummaryProcessor._respect_slide_chapters(chapters, [0], sectioned=False)
+        self.assertEqual(len(flat), 1)
+        self.assertNotIn("sections", flat[0])
+        self.assertIn("More details", flat[0]["summary"])
+
+    def test_slide_alignment_moves_overlapping_sections_and_survives_reload(self):
+        chapters = [
+            {"timestamp": "00:00", "title": "First", "sections": [
+                {"timestamp": "00:00", "title": "Intro", "point": "One"},
+                {"timestamp": "01:05", "title": "Early new-slide detail", "point": "Two"},
+            ]},
+            {"timestamp": "01:10", "title": "Second", "sections": [
+                {"timestamp": "01:10", "title": "Topic", "point": "Three"}]},
+        ]
+        result = SummaryProcessor._respect_slide_chapters(chapters, [0, 60.25])
+        self.assertEqual(result[1]["timestamp"], "00:01:00.250")
+        self.assertEqual(len(result[0]["sections"]), 1)
+        self.assertEqual(result[1]["sections"][0]["timestamp"], result[1]["timestamp"])
+        self.assertEqual([part["point"] for part in result[1]["sections"]], ["Two", "Three"])
+        processor = self._processor(None, None, None)
+        with tempfile.TemporaryDirectory() as temporary, mock.patch(
+                "processors.summary_processor.SUMMARIES_DIR", Path(temporary)):
+            (Path(temporary) / "video.json").write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(asyncio.run(processor.get_summary("video")).content["chapters"], result)
+
+    def test_slide_rules_apply_after_both_generation_pass_choices(self):
+        for passes in ("one", "two"):
+            processor = self._processor(None, None, None)
+            draft = [{"timestamp": "00:00", "title": "Main", "summary": "One"},
+                     {"timestamp": "00:10", "title": "Example", "summary": "Two"}]
+            processor._chunked_chapters = mock.AsyncMock(return_value=json.dumps(draft))
+            processor.enhance_chapters = mock.AsyncMock(return_value=draft)
+            processor._save_chapters = mock.Mock()
+            result = asyncio.run(processor.generate_summary(
+                [{"start": 0, "duration": 30, "text": "Lecture content"}],
+                "video", passes=passes, slide_starts=[0]))
+            self.assertTrue(result.content["success"])
+            self.assertEqual(len(result.content["chapters"]), 1)
+            self.assertEqual(len(result.content["chapters"][0]["sections"]), 2)
+            self.assertEqual(len(processor._save_chapters.call_args.args[1]), 1)
+
+    def test_generation_route_loads_saved_slide_boundaries_only_when_requested(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8"))
+        function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                        and node.name == "generate_summary")
+        function.decorator_list = []
+        processor = SimpleNamespace(generate_summary=mock.AsyncMock(return_value={"success": True}))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            namespace = {"SCENES_DIR": root, "json": json, "re": re, "math": math,
+                         "asyncio": asyncio, "summary_generation_tasks": {},
+                         "Request": object, "JSONResponse": lambda data: data, "summary_processor": processor}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), "<chapter-generation>", "exec"), namespace)
+            def generate(data):
+                return asyncio.run(namespace["generate_summary"](
+                    SimpleNamespace(json=mock.AsyncMock(return_value=data))))
+            result = generate({"video_id": "video", "consider_slides": True})
+            self.assertIn("Detect slides first", result["error"])
+            processor.generate_summary.assert_not_awaited()
+            (root / "video.json").write_text(json.dumps([
+                {"time_seconds": 60.25}, {"time_seconds": 0}, {"time_seconds": 60.25}]), encoding="utf-8")
+            self.assertTrue(generate({"video_id": "video", "consider_slides": True})["success"])
+            self.assertEqual(processor.generate_summary.call_args.kwargs["slide_starts"], [0, 60.25])
+            generate({"video_id": "video", "consider_slides": False})
+            self.assertIsNone(processor.generate_summary.call_args.kwargs["slide_starts"])
+            self.assertFalse(generate({"video_id": "../video", "consider_slides": True})["success"])
+            generate({"video_id": "video", "slide_boundary_scope": "both", "consider_slides": False})
+            options = processor.generate_summary.call_args.kwargs
+            self.assertIsNone(options["slide_starts"])
+            self.assertEqual(options["boundary_slide_starts"], [0, 60.25])
+            self.assertEqual(options["slide_boundary_scope"], "both")
+            self.assertFalse(generate({"video_id": "video", "basis": "speakers",
+                                       "slide_boundary_scope": "both"})["success"])
+            self.assertFalse(generate({"video_id": "video", "basis": "timestamps",
+                                       "slide_boundary_scope": "chapters"})["success"])
+            self.assertFalse(generate({"video_id": "video", "structure": "flat",
+                                       "slide_boundary_scope": "sections"})["success"])
+
+    def test_whole_video_summary_uses_the_entire_transcript_and_one_paragraph(self):
+        processor = self._processor(None, None, None)
+        processor._complete = mock.Mock(return_value="The lecture explains the workflow.\n\nIt finishes with billing.")
+        result = asyncio.run(processor.generate_video_summary([
+            {"text": "OPENING SUBJECT"}, {"text": "ENDING SUBJECT"},
+        ], transcript_language="en"))
+        prompt = processor._complete.call_args.args[2]
+        self.assertIn("OPENING SUBJECT", prompt)
+        self.assertIn("ENDING SUBJECT", prompt)
+        self.assertIn("English", prompt)
+        self.assertEqual(result["summary"], "The lecture explains the workflow. It finishes with billing.")
+        self.assertNotIn("\n", result["summary"])
+        processor._complete.assert_called_once()
+
+    def test_long_video_summary_reduces_all_parts_before_final_synthesis(self):
+        processor = self._processor(None, None, None)
+        prompts = []
+        def complete(provider, model, prompt, *args):
+            prompts.append(prompt)
+            return f"Takeaway from part {len(prompts)}."
+        processor._complete = complete
+        result = asyncio.run(processor.generate_video_summary([
+            {"text": "START " + "lecture " * 4000 + " ENDING"},
+        ], transcript_language="en"))
+        self.assertGreater(len(prompts), 2)
+        self.assertIn("START", prompts[0])
+        self.assertIn("ENDING", prompts[-2])
+        self.assertIn("Takeaway from part 1.", prompts[-1])
+        self.assertIn(f"Takeaway from part {len(prompts) - 1}.", prompts[-1])
+        self.assertEqual(result["summary"], f"Takeaway from part {len(prompts)}.")
+
+    def test_whole_video_summary_falls_back_and_rejects_empty_or_list_output(self):
+        processor = self._processor(None, None, None)
+        processor._complete = mock.Mock(side_effect=["", "- Bullet list", "A valid short whole-video paragraph."])
+        result = asyncio.run(processor.generate_video_summary([{"text": "Lecture"}]))
+        self.assertEqual(result["summary"], "A valid short whole-video paragraph.")
+        self.assertEqual(processor._complete.call_count, 3)
+        processor._complete = mock.Mock(return_value="")
+        with self.assertRaisesRegex(RuntimeError, "empty video summary"):
+            asyncio.run(processor.generate_video_summary([{"text": "Lecture"}]))
+
+    def test_enhancement_keeps_every_takeaway_and_manual_section_time(self):
+        chapters = [{
+            "timestamp": "00:00", "title": "Workflow", "summary": "Overview",
+            "sections": [
+                {"timestamp": "00:05.250", "title": "Step 1", "point": "First detail.", "timestamp_edited": True},
+                {"timestamp": "00:15", "title": "Step 2", "point": "Second detail."},
+            ],
+        }]
+        processor = self._processor(None, None, None)
+        processor._complete = mock.Mock(return_value=json.dumps({"chapters": [{
+            "title": "Complete workflow", "summary": "Overview",
+            "groups": [{"title": "Workflow", "indices": [0, 1]}],
+        }]}))
+        result = asyncio.run(processor.enhance_chapters(chapters, "groq", "test"))
+        self.assertEqual(result[0]["timestamp"], "00:00")
+        self.assertEqual(result[0]["sections"][0]["timestamp"], "00:05.250")
+        self.assertTrue(result[0]["sections"][0]["timestamp_edited"])
+        self.assertEqual(result[0]["sections"][0]["point"], "First detail. Second detail.")
+        self.assertEqual(chapters[0]["sections"][1]["title"], "Step 2")
+
+    def test_enhancement_rejects_omitted_duplicate_reordered_and_boolean_indices(self):
+        units = [{"section": {"timestamp": "00:00"}, "chapter": {"timestamp": "00:00"},
+                  "point": text} for text in ["One", "Two"]]
+        for indices in ([0], [0, 0], [1, 0], [False, 1]):
+            with self.subTest(indices=indices), self.assertRaises(ValueError):
+                SummaryProcessor._apply_outline_groups(units, {"chapters": [{
+                    "title": "Topic", "summary": "", "groups": [{"title": "Section", "indices": indices}],
+                }]})
+
+    def test_two_pass_generation_reviews_outline_and_failure_does_not_save_draft(self):
+        processor = self._processor(None, None, None)
+        processor._chunked_chapters = mock.AsyncMock(return_value='[{"timestamp":"00:00","title":"Draft"}]')
+        processor.enhance_chapters = mock.AsyncMock(return_value=[{"timestamp": "00:00", "title": "Reviewed"}])
+        processor._save_chapters = mock.Mock()
+        transcript = [{"start": 0, "duration": 10, "text": "A topic."}]
+        result = asyncio.run(processor.generate_summary(transcript, "video", passes="two"))
+        self.assertTrue(result.content["success"])
+        self.assertEqual(result.content["chapters"][0]["title"], "Reviewed")
+        processor.enhance_chapters.assert_awaited_once()
+        processor._save_chapters.reset_mock()
+        processor.enhance_chapters.side_effect = RuntimeError("Invalid review")
+        result = asyncio.run(processor.generate_summary(transcript, "video", passes="two"))
+        self.assertFalse(result.content["success"])
+        processor._save_chapters.assert_not_called()
+
+    def test_generation_language_detects_clear_english_despite_foreign_proper_names(self):
+        text = "We use the German product. This is the report and you can edit the data with this tool."
+        self.assertEqual(SummaryProcessor._detect_transcript_language([{"text": text}]), "en")
+
     def test_summary_language_defaults_to_transcript_and_supports_selection(self):
         self.assertIn("same language", SummaryProcessor._summary_language_instruction("transcript"))
         self.assertIn("German", SummaryProcessor._summary_language_instruction("de"))
@@ -385,6 +909,8 @@ class SummaryProviderFallbackTests(unittest.TestCase):
         processor._refresh_openai_client = lambda: None
         processor._refresh_groq_client = lambda: None
         processor._save_chapters = lambda *args: None
+        processor._verify_chapter_boundaries = mock.AsyncMock(side_effect=lambda chapters, *args: chapters)
+        processor._verify_section_boundaries = mock.AsyncMock(side_effect=lambda chapters, *args: chapters)
         return processor
 
     def test_summary_default_prefers_groq_and_preserves_explicit_choice(self):
@@ -607,6 +1133,61 @@ class SummaryProviderFallbackTests(unittest.TestCase):
         self.assertEqual([section["point"] for section in result],
                          [section["point"] for section in sections])
         self.assertIn("group continued explanations", prompts[1])
+
+    def test_same_subtopic_across_requests_extends_existing_section_in_one_pass(self):
+        processor = self._processor(None, None, None)
+        answers = iter([
+            {"chapters": [{"timestamp": "00:00:00", "title": "Workflow", "sections": [
+                {"timestamp": "00:00:00", "title": "Report editing", "point": "Choose the report."},
+            ]}]},
+            {"continued_point": "Adjust its fields and check the result.", "continued_sections": [],
+             "chapters": []},
+        ])
+        prompts = []
+        processor._complete = lambda provider, model, prompt, *args: prompts.append(prompt) or json.dumps(next(answers))
+        transcript = [{"start": index * 10, "duration": 10, "text": "word " * 20} for index in range(24)]
+        with mock.patch("processors.summary_processor.GROQ_CHAPTER_CHUNK_CHARS", 3500):
+            response = asyncio.run(processor.generate_summary(transcript, None))
+        self.assertTrue(response.content["success"], response.content)
+        sections = response.content["chapters"][0]["sections"]
+        self.assertEqual(len(sections), 1, "A request boundary must not create a new subsection")
+        self.assertEqual(sections[0]["timestamp"], "00:00")
+        self.assertEqual(sections[0]["point"], "Choose the report. Adjust its fields and check the result.")
+        self.assertEqual(len(prompts), 2, "No extra AI review pass")
+        self.assertIn('"current_section"', prompts[1])
+        self.assertIn("Choose the report.", prompts[1])
+        self.assertIn("continued_point", prompts[1])
+        self.assertIn("multiple related sentences belong in this same point", prompts[0])
+        self.assertIn("slide or transcript fragment is NOT by itself a topic change", prompts[0])
+
+    def test_continuation_and_genuine_new_subtopic_are_kept_separate(self):
+        chapters, continued = SummaryProcessor._parse_chapter_response(json.dumps({
+            "continued_point": "Continue the same explanation.",
+            "continued_sections": [{"timestamp": "01:10", "title": "Billing", "point": "Review charges."}],
+            "chapters": [],
+        }))
+        self.assertEqual(chapters, [])
+        self.assertTrue(continued[0]["continue_previous"])
+        self.assertEqual(continued[1]["title"], "Billing")
+        with self.assertRaises(json.JSONDecodeError):
+            SummaryProcessor._parse_chapter_response('{"continued_point": [], "chapters": []}')
+
+    def test_duplicate_adjacent_topics_merge_without_time_based_caps(self):
+        chapters = SummaryProcessor._normalize_chapters([
+            {"timestamp": "00:00", "title": "Report editing", "sections": [
+                {"timestamp": "00:00", "title": "Fields", "point": "Choose fields."},
+                {"timestamp": "00:10", "title": "Fields", "point": "Rename fields."},
+            ]},
+            {"timestamp": "00:20", "title": "Report editing", "sections": [
+                {"timestamp": "00:20", "title": "Fields", "point": "Check fields."},
+                {"timestamp": "00:30", "title": "Permissions", "point": "Choose access."},
+            ]},
+            {"timestamp": "00:40", "title": "Billing", "sections": []},
+        ], [], end=50)
+        self.assertEqual([chapter["title"] for chapter in chapters], ["Report editing", "Billing"])
+        self.assertEqual([section["title"] for section in chapters[0]["sections"]], ["Fields", "Permissions"])
+        self.assertEqual(chapters[0]["sections"][0]["point"], "Choose fields. Rename fields. Check fields.")
+        self.assertEqual(chapters[1]["timestamp"], "00:40", "A genuine brief topic must remain")
 
     def test_flat_structure_and_detail_level_change_the_prompt(self):
         processor = self._processor(None, None, None)
@@ -899,6 +1480,87 @@ class SummaryProviderFallbackTests(unittest.TestCase):
         self.assertIn("22m0.192s", response.content["error"])
         self.assertNotIn("add GROQ_API_KEY", response.content["error"])
         processor._save_chapters.assert_not_called()
+
+
+class TranscriptGapTests(unittest.TestCase):
+    def test_speaker_generation_applies_option_before_saving_and_defaults_off(self):
+        processor = SummaryProcessor.__new__(SummaryProcessor)
+        processor._save_chapters = mock.Mock()
+        transcript = [{"start": 0, "duration": 5, "text": "One", "speaker": "A"},
+                      {"start": 20, "duration": 5, "text": "Two", "speaker": "A"}]
+        with mock.patch("processors.summary_processor.JSONResponse", side_effect=lambda data: data):
+            result = asyncio.run(processor.generate_summary(
+                transcript, "video", basis="speakers", flag_transcript_gaps=True))
+            self.assertTrue(result["success"], result)
+            self.assertTrue(result["chapters"][0]["sections"][1]["transcript_gap"])
+            self.assertEqual(processor._save_chapters.call_args.args[1], result["chapters"])
+            result = asyncio.run(processor.generate_summary(transcript, "video", basis="speakers"))
+            self.assertNotIn("sections", result["chapters"][0])
+            for threshold in (True, 0, 301, float("nan")):
+                result = asyncio.run(processor.generate_summary(
+                    transcript, "video", basis="speakers", transcript_gap_seconds=threshold))
+                self.assertFalse(result["success"])
+
+    def test_threshold_overlap_resume_and_chapter_boundaries(self):
+        chapters = [
+            {"timestamp": "00:00", "title": "First", "sections": [
+                {"timestamp": "00:00", "title": "A", "point": "Alpha"},
+                {"timestamp": "00:15", "title": "B", "point": "Beta"}]},
+            {"timestamp": "00:25", "title": "Second", "summary": "Second summary"},
+        ]
+        transcript = [
+            {"start": 0, "duration": 5, "text": "Opening"},
+            {"start": 3, "duration": 4, "text": "Overlapping cue"},
+            {"start": 17, "duration": 3, "text": "Next"},
+            {"start": 20, "duration": 0, "text": "   "},
+            {"start": 35, "duration": 5, "text": "Return"},
+        ]
+        original = json.dumps(chapters)
+        saved = SummaryProcessor._separate_transcript_gaps(chapters, transcript, 10)
+        self.assertEqual(json.dumps(chapters), original)
+        self.assertEqual([c["timestamp"] for c in saved], ["00:00", "00:25"])
+        rows = saved[0]["sections"]
+        self.assertEqual([SummaryProcessor._timestamp_value(s["timestamp"]) for s in rows], [0, 7, 17, 20])
+        self.assertEqual(rows[2]["title"], "B")
+        self.assertEqual(rows[2]["point"], "Beta")
+        second = saved[1]["sections"]
+        self.assertEqual([SummaryProcessor._timestamp_value(s["timestamp"]) for s in second], [25, 35])
+        self.assertEqual(second[1]["title"], "Second")
+        gaps = [s for c in saved for s in c["sections"] if s.get("transcript_gap")]
+        self.assertEqual(len(gaps), 3)
+        self.assertTrue(all(s["flagged"] and not s["skipped"] for s in gaps))
+        self.assertTrue(all(s["title"] == "No transcript text" for s in gaps))
+
+    def test_short_gaps_unchanged_and_known_duration_includes_tail(self):
+        chapters = [{"timestamp": "00:00", "title": "Topic"}]
+        transcript = [{"start": 0, "duration": 5, "text": "A"}, {"start": 14.9, "duration": 5, "text": "B"}]
+        self.assertEqual(SummaryProcessor._separate_transcript_gaps(chapters, transcript, 10), chapters)
+        saved = SummaryProcessor._separate_transcript_gaps(chapters, transcript, 10, 30)
+        self.assertEqual(len(saved[0]["sections"]), 2)
+        self.assertAlmostEqual(SummaryProcessor._timestamp_value(saved[0]["sections"][1]["timestamp"]), 19.9)
+        self.assertTrue(saved[0]["sections"][1]["transcript_gap"])
+
+
+class MergedSectionDescriptionTests(unittest.TestCase):
+    def test_combined_description_requests_every_sections_topics_and_information(self):
+        processor = SummaryProcessor.__new__(SummaryProcessor)
+        processor._refresh_clients = mock.Mock()
+        processor._provider_chain = mock.Mock(return_value=[("groq", "test-model")])
+        processor._complete = mock.Mock(return_value=json.dumps({
+            "title": "Architecture and deployment",
+            "summary": "The architecture separates services. Deployment uses staged releases.",
+        }))
+        result = asyncio.run(processor.summarize_outline_part([
+            {"text": "Section 1: Architecture\nThe architecture separates services."},
+            {"text": "Section 2: Deployment\nDeployment uses staged releases."},
+        ], "en", combined=True))
+        prompt = processor._complete.call_args.args[2]
+        self.assertIn("across all supplied sections, not just the first", prompt)
+        self.assertIn("every supplied section in chronological order", prompt)
+        self.assertIn("Section 1: Architecture", prompt)
+        self.assertIn("Section 2: Deployment", prompt)
+        self.assertEqual(result["title"], "Architecture and deployment")
+        self.assertIn("staged releases", result["summary"])
 
 
 if __name__ == "__main__":

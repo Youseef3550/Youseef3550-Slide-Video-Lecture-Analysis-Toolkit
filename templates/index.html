@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <link rel="stylesheet" href="/static/styles.css?v=slide-downloads-20261007">
     <link rel="stylesheet" href="/static/compact-layout.css?v=slide-downloads-20261007">
-    <link rel="stylesheet" href="/static/theme.css?v=slide-downloads-20261007">
+    <link rel="stylesheet" href="/static/theme.css?v=visible-options-20261019">
     <style>
         /* Styles for fuzzy search highlighting */
         .search-highlight {
@@ -43,6 +43,22 @@
 
     <div class="container">
         <div class="input-section">
+            <div class="project-history-controls" role="group" aria-label="Project history">
+                <button id="projectBackBtn" class="btn btn-secondary btn-icon" type="button" title="No previous project" aria-label="No previous project" disabled><i class="fas fa-arrow-left" aria-hidden="true"></i></button>
+                <button id="projectNextBtn" class="btn btn-secondary btn-icon" type="button" title="No next project" aria-label="No next project" disabled><i class="fas fa-arrow-right" aria-hidden="true"></i></button>
+            </div>
+            <div class="content-history-controls" role="group" aria-label="Saved content history">
+                <button id="undoContentBtn" class="btn btn-secondary" type="button" title="Undo saved content change (Ctrl+Z)" aria-label="Undo saved content change" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button>
+                <button id="redoContentBtn" class="btn btn-secondary" type="button" title="Redo saved content change (Ctrl+Shift+Z)" aria-label="Redo saved content change" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button>
+                <span id="contentHistoryStatus" role="status" aria-live="polite"></span>
+            </div>
+            <div class="example-videos-container">
+                <label for="videoVersions">Video version</label>
+                <select id="videoVersions" class="example-videos-select" disabled>
+                    <option value="">Original video</option>
+                </select>
+                <button id="openVideoSpeedBtn" class="btn btn-secondary btn-options btn-icon" type="button" title="Export video at a different speed" aria-label="Export video at a different speed"><i class="fas fa-tachometer-alt" aria-hidden="true"></i></button>
+            </div>
             <a class="brand" href="/" title="LectureSeek - lecture video analysis">
                 <span class="brand-mark" aria-hidden="true"><i class="fas fa-play"></i></span>
                 <span class="brand-name">LectureSeek</span>
@@ -65,12 +81,130 @@
             <details id="extraOptionsMenu" class="extra-options">
                 <summary class="btn btn-secondary">Extra options</summary>
                 <div class="extra-options-menu">
+                    <button id="manageLibraryBtn" class="btn btn-secondary btn-options" type="button">Manage saved files</button>
                     <button id="openVttBatchBtn" class="btn btn-secondary btn-options" type="button">Translate VTT files</button>
+                    <button id="openClipMergeBtn" class="btn btn-secondary btn-options" type="button">Merge video clips</button>
+                    <button id="openClipTrimBtn" class="btn btn-secondary btn-options" type="button">Trim uploaded clips</button>
+                    <button id="openUploadedSplitBtn" class="btn btn-secondary btn-options" type="button">Split uploaded video</button>
                     <button id="settingsBtn" class="btn btn-secondary btn-options" type="button" aria-label="Settings" title="Settings">
                         <i class="fas fa-cog"></i> Settings
                     </button>
                 </div>
             </details>
+            <form id="projectSearchForm" class="project-search-bar" role="search" aria-label="Project search">
+                <input id="librarySearchQuery" type="search" required maxlength="200" placeholder="Search projects..." autocomplete="off" aria-label="Keyword or phrase">
+                <div class="project-search-button">
+                    <button id="openLibrarySearchBtn" class="btn btn-secondary btn-action" type="submit"><i class="fas fa-search" aria-hidden="true"></i> Search</button>
+                    <select id="projectSearchScope" aria-label="Search scope">
+                        <option value="current" selected>Open project only</option>
+                        <option value="all">All projects</option>
+                    </select>
+                </div>
+            </form>
+            <dialog id="librarySearchDialog" class="options-dialog" aria-labelledby="librarySearchHeading">
+                <form method="dialog">
+                    <div class="dialog-header">
+                        <h2 id="librarySearchHeading">Search results</h2>
+                        <button class="dialog-close" type="submit" aria-label="Close saved video search">&times;</button>
+                    </div>
+                </form>
+                <form id="librarySearchForm">
+                    <label for="librarySearchKind">Search in</label>
+                    <select id="librarySearchKind">
+                        <option value="all">Everything</option>
+                        <option value="video">Video names</option>
+                        <option value="transcript">Transcripts</option>
+                        <option value="chapter">Chapter titles</option>
+                        <option value="section">Sections and their text</option>
+                        <option value="summary">Chapter and video summaries</option>
+                    </select>
+                    <button class="btn btn-primary" type="submit">Search</button>
+                </form>
+                <details class="contextual-help"><summary aria-label="Search help" title="Search help">?</summary><p>Search includes saved text, translations and versions, not unsaved edits, audio or images. Results show their source version; opening a result does not overwrite the selected transcript.</p></details>
+                <p id="librarySearchStatus" role="status" aria-live="polite"></p>
+                <ol id="librarySearchResults" class="library-search-results"></ol>
+                <button id="librarySearchMoreBtn" class="btn btn-secondary btn-action" type="button" hidden>Show more results</button>
+            </dialog>
+            <dialog id="clipMergeDialog" class="options-dialog" aria-labelledby="clipMergeHeading">
+                <form method="dialog">
+                    <div class="dialog-header">
+                        <h2 id="clipMergeHeading">Trim / merge uploaded clips</h2>
+                        <button class="dialog-close" type="submit" aria-label="Close clip merger">&times;</button>
+                    </div>
+                </form>
+                <label>Video title <input id="clipMergeTitle" value="Merged clips" maxlength="150"></label>
+                <label>Output
+                    <select id="clipMergeOutput">
+                        <option value="video" selected>Video only (download MP4)</option>
+                        <option value="project">Video + saved project</option>
+                    </select>
+                </label>
+                <label>Add clips <input id="clipMergeFiles" type="file" accept=".mp4,.mkv,.webm,.mov,.avi,.m4v" multiple></label>
+                <small>1–30 clips, up to 2 GB each / 5 GB total. Set Start and End per clip (MM:SS or HH:MM:SS, optional milliseconds); blank End keeps the rest. One clip trims; multiple clips merge in the order below. Creates a 720p MP4; saving a project is optional. Video only skips the extra library copy. Originals stay unchanged. Burned-in captions remain; embedded subtitle tracks are not copied.</small>
+                <ol id="clipMergeList"></ol>
+                <div class="row-actions">
+                    <button id="startClipMergeBtn" class="btn btn-primary" type="button">Merge clips</button>
+                    <button id="downloadMergedClipsBtn" class="btn btn-secondary btn-action" type="button" hidden>Download MP4</button>
+                    <button id="openMergedProjectBtn" class="btn btn-secondary btn-action" type="button" hidden>Open project</button>
+                </div>
+                <p id="clipMergeStatus" role="status" aria-live="polite"></p>
+            </dialog>
+            <dialog id="videoSpeedDialog" class="options-dialog" aria-labelledby="videoSpeedHeading">
+                <form method="dialog"><div class="dialog-header">
+                    <h2 id="videoSpeedHeading">Change video speed</h2>
+                    <button class="dialog-close" type="submit" aria-label="Close video speed options">&times;</button>
+                </div></form>
+                <label>Speed <select id="exportVideoSpeed">
+                    <option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="0.75">0.75x</option>
+                    <option value="1" selected>1x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option>
+                    <option value="1.75">1.75x</option><option value="2">2x</option><option value="3">3x</option><option value="4">4x</option>
+                </select></label>
+                <label>Range <select id="videoSpeedScope"><option value="full">Entire selected video</option><option value="range">Custom range</option></select></label>
+                <div id="videoSpeedRange" hidden>
+                    <label>Start <div class="custom-clip-time-field"><input id="videoSpeedStart" value="00:00"><button id="videoSpeedStartHere" class="btn btn-secondary btn-icon" type="button" title="Start here" aria-label="Set speed range start to current video time"><i class="fas fa-map-pin" aria-hidden="true"></i></button></div></label>
+                    <label>End <div class="custom-clip-time-field"><input id="videoSpeedEnd" placeholder="Video end"><button id="videoSpeedEndHere" class="btn btn-secondary btn-icon" type="button" title="End here" aria-label="Set speed range end to current video time"><i class="fas fa-map-pin" aria-hidden="true"></i></button></div></label>
+                </div>
+                <label>Output <select id="videoSpeedOutput"><option value="video">Download MP4</option><option value="project">New project + MP4</option></select></label>
+                <details class="contextual-help"><summary aria-label="Video speed export help" title="Video speed export help">?</summary><p>Uses the selected original or captioned video version. Audio speed changes without changing voice pitch. A new project copies the selected transcript, saved chapters, speakers and slides, clipping and scaling their timestamps without rerunning AI. Embedded text subtitles are retimed too; burned-in captions stay in the video. Originals and previous exports are unchanged. Encoding may take time; close these options and return later to check progress. Bitmap subtitles cannot be retimed.</p></details>
+                <div class="row-actions">
+                    <button id="startVideoSpeedBtn" class="btn btn-primary" type="button">Create video</button>
+                    <button id="downloadVideoSpeedBtn" class="btn btn-secondary btn-action" type="button" hidden>Download MP4</button>
+                    <button id="openSpeedProjectBtn" class="btn btn-secondary btn-action" type="button" hidden>Open new project</button>
+                </div>
+                <p id="videoSpeedStatus" role="status" aria-live="polite"></p>
+            </dialog>
+            <dialog id="videoSplitDialog" class="options-dialog" aria-labelledby="videoSplitHeading">
+                <form method="dialog">
+                    <div class="dialog-header">
+                        <h2 id="videoSplitHeading">Split video into parts</h2>
+                        <button class="dialog-close" type="submit" aria-label="Close video splitter">&times;</button>
+                    </div>
+                </form>
+                <label id="splitVideoFileLabel">Video (up to 2 GB)
+                    <input id="splitVideoFile" type="file" accept=".mp4,.mkv,.webm,.mov,.avi,.m4v">
+                </label>
+                <label>Cut timestamps
+                    <textarea id="splitVideoCuts" rows="4" maxlength="4000" placeholder="10:00&#10;25:00"></textarea>
+                </label>
+                <small>Enter 1-99 cut points in increasing order, separated by new lines or commas (MM:SS or HH:MM:SS, optional milliseconds). Do not include 00:00 or video end. For example, 10:00 and 25:00 create three parts: start–10:00, 10:00–25:00, and 25:00–end. Downloads a ZIP of numbered MP4s at the source resolution. No transcript, AI or new project is needed; originals and saved chapters stay unchanged.</small>
+                <div class="row-actions">
+                    <button id="startVideoSplitBtn" class="btn btn-primary" type="button">Create parts</button>
+                    <button id="downloadVideoSplitBtn" class="btn btn-secondary btn-action" type="button" hidden>Download ZIP</button>
+                </div>
+                <p id="videoSplitStatus" role="status" aria-live="polite"></p>
+            </dialog>
+            <dialog id="libraryDialog" class="options-dialog" aria-labelledby="libraryHeading">
+                <form method="dialog">
+                    <div class="dialog-header">
+                        <h2 id="libraryHeading">Manage saved files</h2>
+                        <button class="dialog-close" type="submit" aria-label="Close saved files">&times;</button>
+                    </div>
+                    <label><input id="deleteUploadExports" type="checkbox"> Also delete exports when deleting an upload</label>
+                    <p>Unchecked keeps completed exports. Independent chapter projects are always kept.</p>
+                    <p id="libraryStatus" role="status"></p>
+                    <div id="libraryItems"></div>
+                </form>
+            </dialog>
             <dialog id="vttBatchDialog" class="options-dialog" aria-labelledby="vttBatchHeading">
                 <form method="dialog">
                     <div class="dialog-header">
@@ -87,14 +221,16 @@
                         <option value="ar">Arabic</option>
                         <option value="pl">Polish</option>
                     </select>
-                    <label for="vttBatchModel">Translation model</label>
+                    <label for="vttBatchModel">Translation service / model</label>
                     <select id="vttBatchModel"></select>
                     <small id="vttBatchModelStatus" role="status"></small>
                     <label><input id="vttBatchFallback" type="checkbox" checked> Allow model fallback</label>
-                    <details class="ui-disclosure"><summary>Help</summary><p>Auto prefers configured Groq.
+                    <details class="ui-disclosure"><summary>Help</summary><p>Auto tries configured LLMs first (Groq preferred), then open-source LibreTranslate,
+                        then Microsoft Translator if configured.
                         Groq has request and token limits. Other providers may incur charges, including fallback calls.
-                        Turn fallback off and choose a model to use only that model.
-                        Timestamps and cue formatting stay unchanged. Results include reported token usage.</p></details>
+                        Choosing a specific model turns fallback off; enable it explicitly to allow switching.
+                        Selections are locked while a batch is running.
+                        Timestamps and cue formatting stay unchanged. Results include LLM token usage or service character counts.</p></details>
                     <div class="dialog-actions">
                         <button class="btn btn-secondary" type="submit">Close</button>
                         <button id="translateVttBatchBtn" class="btn btn-primary" type="button">Translate files</button>
@@ -116,6 +252,24 @@
             <p>Loading video and processing data...</p>
         </div>
 
+        <section id="transcriptReadyPrompt" class="transcript-ready-prompt" aria-labelledby="transcriptReadyHeading" aria-live="polite" hidden>
+            <strong id="transcriptReadyHeading"><i class="fas fa-check-circle" aria-hidden="true"></i> Transcript ready. Choose your next step</strong>
+            <p>Create chapters, detect slides, or start both together.</p>
+            <div class="row-actions">
+                <button class="btn btn-primary" type="button" data-ready-action="chapters">Chapters</button>
+                <button class="btn btn-secondary" type="button" data-ready-action="slides">Slides</button>
+                <button class="btn btn-primary" type="button" data-ready-action="both">Both</button>
+                <button class="btn btn-secondary" type="button" data-ready-action="none">Not now</button>
+                <label><input id="rememberTranscriptReady" type="checkbox"> Always do this when I upload new videos</label>
+            </div>
+        </section>
+        <section id="transcriptJobStatus" class="transcript-job-status" aria-label="Transcript processing" hidden>
+            <progress aria-label="Transcript processing progress"></progress>
+            <span class="transcript-job-message" role="status"></span>
+            <button type="button" class="btn btn-secondary" data-job-details>Show progress</button>
+            <button type="button" class="btn btn-secondary" data-job-stop>Stop</button>
+            <button type="button" class="btn btn-secondary" data-job-dismiss hidden>Dismiss</button>
+        </section>
         <div class="main-content">
             <!-- Left column: Video player and timeline -->
             <div class="video-container">
@@ -127,19 +281,13 @@
                     </video>
                 </div>
                 <p id="currentChapterTitle" class="chapter-caption" aria-live="polite">No chapter or slide title available at this time.</p>
+                <div class="row-actions compatible-audio-row">
+                    <span id="audioOptionsLabel">Audio</span>
+                    <label id="compatibleAudioControls" hidden><input id="compatibleAudioVolume" type="range" min="0" max="1" step="0.05" value="1"> Audio volume</label>
+                    <p id="compatibleAudioStatus" role="status" aria-live="polite" hidden></p>
+                    <details class="contextual-help"><summary aria-label="Audio help and options" title="Audio help and options">?</summary><p>Audio is automatic: native playback is used when supported. If this browser cannot decode the audio, a synchronized WAV copy is prepared without changing the original. Use Audio volume when that copy is active. If automatic detection cannot identify an audio problem, choose Compatible audio below.</p><label>Audio mode <select id="compatibleAudioMode"><option value="auto" selected>Automatic (recommended)</option><option value="native">Native audio</option><option value="compatible">Compatible audio</option></select></label></details>
+                </div>
                 <div class="video-controls" aria-label="Video controls">
-                    <label for="navigationGrouping">Navigate by</label>
-                    <select id="navigationGrouping">
-                        <option value="topic" selected>Content chapters</option>
-                        <option value="slides">Slide changes only</option>
-                        <option value="combined">Content chapters and slide changes</option>
-                    </select>
-                    <button id="previousChapterBtn" class="btn btn-secondary" type="button" title="Previous chapter">
-                        <i class="fas fa-step-backward"></i> Previous
-                    </button>
-                    <button id="nextChapterBtn" class="btn btn-secondary" type="button" title="Next chapter">
-                        Next <i class="fas fa-step-forward"></i>
-                    </button>
                     <label for="playbackSpeed">Speed</label>
                     <select id="playbackSpeed" aria-label="Playback speed">
                         <option value="0.5">0.5x</option>
@@ -147,8 +295,36 @@
                         <option value="1" selected>1x</option>
                         <option value="1.25">1.25x</option>
                         <option value="1.5">1.5x</option>
+                        <option value="1.75">1.75x</option>
                         <option value="2">2x</option>
                     </select>
+                    <details id="navigationGrouping" class="ui-disclosure">
+                        <summary>Navigate by</summary>
+                        <div role="group" aria-label="Navigation boundaries">
+                            <label><input id="navigateChapters" type="checkbox" checked> Chapters</label>
+                            <label><input id="navigateSections" type="checkbox"> Sections</label>
+                            <label><input id="navigateSlides" type="checkbox"> Slide changes</label>
+                        </div>
+                    </details>
+                    <button id="previousChapterBtn" class="btn btn-secondary" type="button" title="Previous chapter">
+                        <i class="fas fa-step-backward"></i> Previous
+                    </button>
+                    <button id="nextChapterBtn" class="btn btn-secondary" type="button" title="Next chapter">
+                        Next <i class="fas fa-step-forward"></i>
+                    </button>
+                    <button id="takeScreenshotBtn" class="btn btn-secondary btn-action btn-icon" type="button" disabled title="Take screenshot" aria-label="Take screenshot">
+                        <i class="fas fa-camera" aria-hidden="true"></i>
+                    </button>
+                    <div class="seek-jump-controls" role="group" aria-label="Skip backward or forward">
+                        <div class="seek-jump-choice">
+                        <button id="jumpBackSecondBtn" class="btn btn-secondary seek-jump" type="button" title="Jump backward 1 second (hold to repeat)" aria-label="Jump backward 1 second" disabled><i class="fas fa-undo" aria-hidden="true"></i><span class="seek-jump-number" aria-hidden="true">1s</span></button>
+                        <select id="seekBackInterval" aria-label="Backward skip interval" title="Backward skip interval" disabled><option value="1">1 second</option><option value="60">1 minute</option></select>
+                        </div>
+                        <div class="seek-jump-choice">
+                        <button id="jumpForwardSecondBtn" class="btn btn-secondary seek-jump" type="button" title="Jump forward 1 second (hold to repeat)" aria-label="Jump forward 1 second" disabled><i class="fas fa-redo" aria-hidden="true"></i><span class="seek-jump-number" aria-hidden="true">1s</span></button>
+                        <select id="seekForwardInterval" aria-label="Forward skip interval" title="Forward skip interval" disabled><option value="1">1 second</option><option value="60">1 minute</option></select>
+                        </div>
+                    </div>
                     <div class="toggle-container timeline-marker-toggle" title="Show slide changes as marks on the timeline below">
                         <label class="toggle-switch">
                             <input type="checkbox" id="sceneToggle" checked>
@@ -162,8 +338,19 @@
                 <div id="videoProgress" class="video-progress-container">
                     <div id="timeMarker" class="time-marker"></div>
                     <div id="progressHoverTime" class="progress-hover-time"></div>
+                    <div id="customClipRange" class="custom-clip-range" hidden>
+                        <div id="customClipRangeSelection" class="custom-clip-range-selection"></div>
+                        <button id="customClipStartMarker" class="custom-clip-marker custom-clip-marker-start" type="button" role="slider" aria-label="Custom clip start" aria-orientation="horizontal">IN</button>
+                        <button id="customClipEndMarker" class="custom-clip-marker custom-clip-marker-end" type="button" role="slider" aria-label="Custom clip end" aria-orientation="horizontal">OUT</button>
+                    </div>
                     <!-- Scene markers will be added here -->
                 </div>
+                <button id="customClipMarkBtn" class="btn btn-secondary btn-action" type="button" hidden>Start here</button>
+                <section id="speakerTimeline" class="speaker-timeline" aria-label="Speaker timeline" hidden>
+                    <div class="speaker-timeline-heading"><strong>Speakers</strong><span id="speakerTimelineDuration"></span></div>
+                    <p class="speaker-timeline-help">Colored intervals show when each speaker talks. Click a lane to seek.</p>
+                    <div id="speakerTimelineRows" class="speaker-timeline-rows"></div>
+                </section>
                 </div>
                 <div class="layout-splitter" id="timelineSplitter" role="separator" aria-orientation="vertical" aria-label="Resize visual timeline" title="Drag to resize. Double-click to reset." tabindex="0"></div>
                 <div class="timeline-container" data-pane="timeline">
@@ -220,7 +407,7 @@
                 
                 <div class="tab-content">
                     <div class="tab-pane active" id="transcript-tab">
-                        <div class="controls-bar">
+                        <div class="controls-bar transcript-controls">
                             <div class="search-container">
                                 <div class="search-input-wrapper">
                                     <input type="text" id="transcriptSearch" class="search-input" placeholder="Search transcript...">
@@ -261,6 +448,12 @@
                                 <button id="deleteTranscriptVersionBtn" class="btn btn-danger transcript-version-delete" type="button" aria-label="Delete this saved version" title="Delete this saved version"><i class="fas fa-trash-alt"></i></button>
                             </div>
                             <div class="transcript-export-actions">
+                                <button id="identifySpeakersBtn" class="btn btn-secondary btn-action" type="button" title="Keep transcript text and add speaker labels">Label speakers</button>
+                                <select id="speakerMode" class="speaker-mode-select" aria-label="Speaker identification mode" title="Fast analyzes the full audio with less overlap. Short speaker changes may be less precise. Applies to Label speakers and transcription with speaker identification.">
+                                    <option value="standard">Speakers: Standard</option>
+                                    <option value="fast" selected>Speakers: Fast</option>
+                                </select>
+                                <button id="edit-transcript-btn" class="btn btn-secondary btn-action" type="button" disabled>Edit transcript</button>
                                 <button id="openCaptionStyleBtn" class="btn btn-secondary btn-action" type="button"><i class="fas fa-film" aria-hidden="true"></i> Add captions to video</button>
                                 <button id="downloadTranscriptBtn" class="btn btn-secondary btn-action" type="button"><i class="fas fa-download" aria-hidden="true"></i> Download transcript</button>
                             </div>
@@ -295,7 +488,6 @@
                                 <textarea id="transcriptPrompt" rows="2" maxlength="2000" placeholder="Example: SAP lecture about S/4HANA and Fiori; lecturer Dr. MÃ¼ller. Preserve acronyms and product names."></textarea>
                                 <small>Names and terms to recognize.</small>
                                 <label><input type="checkbox" id="transcriptDiarization"> Identify speakers</label>
-                                <button id="identifySpeakersBtn" class="btn btn-secondary btn-action" type="button" title="Keeps the current transcript text and only adds speaker labels (also to its translations)">Label current speakers</button>
                                 <small id="speakerDiarizationHelp">
                                     <strong id="speakerDiarizationTokenStatus"></strong>
                                     <span id="speakerDiarizationSetup">
@@ -310,7 +502,6 @@
                                 </div>
                                 </details>
                                 <button id="regenerateTranscriptAction" class="btn btn-secondary btn-action" type="button">Regenerate transcript</button>
-                                <div id="speakerNamesPanel" class="speaker-names-panel" hidden></div>
                                 <label for="transcriptFile">Upload transcript file</label>
                                 <input id="transcriptFile" type="file" accept=".txt,.srt,.vtt,.json">
                                 <button id="uploadTranscriptBtn" class="btn btn-secondary btn-action" type="button">Use uploaded transcript</button>
@@ -330,12 +521,13 @@
                                     <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite</option>
                                     <option value="groq:openai/gpt-oss-120b">Groq GPT-OSS 120B (free)</option>
                                     <option value="groq:openai/gpt-oss-20b">Groq GPT-OSS 20B</option>
-                                    <option value="groq:llama-3.3-70b-versatile">Groq Llama 3.3 70B</option>
                                     <option value="gpt-4.1-mini">OpenAI GPT-4.1 mini (paid)</option>
+                                    <option value="libretranslate">LibreTranslate (open source)</option>
+                                    <option value="microsoft-translator">Microsoft Translator v3 (NMT)</option>
                                 </select>
                                 <small id="translationModelStatus">Checking configured translation models...</small>
                                 <label><input id="translationFallback" type="checkbox" checked> Allow model fallback</label>
-                                <small>Turn off and choose a model to use only that model. Provider limits and charges apply.</small>
+                                <small>Choosing a model turns fallback off. Enable it to permit switching. Provider limits and charges apply.</small>
                                 <button id="translateTranscriptBtn" class="btn btn-secondary btn-action" type="button" disabled>Translate transcript</button>
                             </div>
                             <div class="dialog-actions">
@@ -447,6 +639,7 @@
                                 </form>
                             </dialog>
                         </div>
+                        <div id="speakerNamesPanel" class="speaker-names-panel" hidden></div>
                         <p id="transcriptSourceInfo" class="transcript-source-info" hidden></p>
                         <div class="tab-body" id="transcriptContainer">
                             <!-- Transcript lines will be added here -->
@@ -489,18 +682,69 @@
                             <div id="notesSummary"></div>
                         </div>
                     </div>
-<div class="tab-pane" id="chapters-tab">
 
+                    <div class="tab-pane" id="chapters-tab">
+                        <details id="videoSummaryPanel" class="video-summary-panel" hidden>
+                            <summary id="videoSummaryHeading">Video summary</summary>
+                            <p id="videoSummaryText" dir="auto" tabindex="0" aria-label="Whole-video summary"></p>
+                        </details>
+                        <p id="videoSummaryStatus" class="video-summary-status" role="status" aria-live="polite" hidden></p>
                         <div class="controls-bar chapter-controls">
                             <button id="generateSummaryBtn" class="btn btn-accent" disabled>
-                                <i class="fas fa-magic"></i> Generate Summary
+                                <i class="fas fa-magic"></i> Generate chapters
                             </button>
                             <button id="summaryOptionsBtn" class="btn btn-secondary btn-options" type="button">Chapter options</button>
-                            <label title="Show already detected slides beneath chapters and sections. Does not detect slides or run OCR.">
-                                <input type="checkbox" id="chapterSlidesToggle"> Add detected slides
-                            </label>
+                            <dialog id="chapterTranslationDialog" class="options-dialog" aria-labelledby="chapterTranslationHeading">
+                                <form method="dialog">
+                                    <div class="dialog-header">
+                                        <h2 id="chapterTranslationHeading">Translate chapters</h2>
+                                        <button class="dialog-close" type="submit" aria-label="Close chapter translation">&times;</button>
+                                    </div>
+                                </form>
+                                <label for="contentTranslationTarget">Match transcript language</label>
+                                <select id="contentTranslationTarget">
+                                    <option value="transcript" selected>Open transcript's language</option>
+                                </select>
+                                <p id="chapterTranslationContext" role="status"></p>
+                                <details class="ui-disclosure">
+                                    <summary>? Translation help</summary>
+                                    <p>Translates chapter titles, summaries and sections without changing timing or structure. The result is saved in the chosen language. It does not switch or translate the transcript. Saved transcript translations are offered as destinations.</p>
+                                </details>
+                                <button id="confirmChapterTranslationBtn" class="btn btn-primary" type="button">Translate and save</button>
+                            </dialog>
+                            <dialog id="savedChaptersDialog" class="options-dialog" aria-labelledby="savedChaptersHeading">
+                                <form method="dialog">
+                                    <div class="dialog-header">
+                                        <h2 id="savedChaptersHeading">Saved chapters</h2>
+                                        <button class="dialog-close" type="submit" aria-label="Close saved chapters">&times;</button>
+                                    </div>
+                                </form>
+                                <p id="savedChaptersStatus" role="status"></p>
+                                <div id="savedChaptersList" class="chapter-tools-grid"></div>
+                                <details class="ui-disclosure"><summary>? Saved chapters help</summary>
+                                    <p>Open chapters together with their saved transcript. Changing generation options does not delete chapters. Regeneration replaces the current outline for that transcript language; earlier runs that were never archived are not recoverable here.</p>
+                                </details>
+                            </dialog>
                             <div id="summaryOptionsPanel" class="summary-options" hidden>
-                                <label for="summaryModel">Chapter generation model</label>
+                                <div class="chapter-options-heading">
+                                    <strong>Chapter options</strong>
+                                    <button id="closeChapterOptionsBtn" class="btn btn-secondary" type="button">Close options</button>
+                                </div>
+                                <button id="translateChaptersBtn" class="btn btn-secondary btn-action" type="button" disabled>Translate chapters...</button>
+                                <button id="loadSavedChaptersBtn" class="btn btn-secondary btn-action" type="button">Open saved chapters...</button>
+                                <button id="edit-chapters-btn" class="btn btn-secondary btn-action" type="button" disabled>Reorganize chapters</button>
+                                <label><input type="checkbox" id="chapterPlaybackTracking" checked> Highlight current chapter and section during playback</label>
+                                <details class="chapter-tools-disclosure">
+                                    <summary>Outline tools</summary>
+                                    <div class="chapter-tools-grid">
+                                        <button id="generateVideoSummaryBtn" class="btn btn-secondary btn-action" type="button" disabled>Generate video summary</button>
+                                        <button id="enhanceChaptersBtn" class="btn btn-secondary btn-action" type="button" disabled>Enhance chapters</button>
+                                        <button id="reviewDisruptionsBtn" class="btn btn-secondary btn-action" type="button" disabled title="Suggest transcript-supported interruptions for review. Nothing is skipped automatically.">Flag disruptions</button>
+                                        <label><input type="checkbox" id="chapterSlidesToggle"> Show detected slides in outline</label>
+                                    </div>
+                                </details>
+                                <strong>Generation settings</strong>
+                                <label for="summaryModel">Chapter and summary model</label>
                                 <select id="summaryModel">
                                     <option value="" selected>Automatic: Groq first, then Gemini</option>
                                     <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
@@ -508,6 +752,33 @@
                                     <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite</option>
                                     <option value="groq:openai/gpt-oss-120b">Groq GPT-OSS 120B (free)</option>
                                     <option value="gpt-4.1-mini">OpenAI GPT-4.1 mini (paid)</option>
+                                </select>
+                                <label for="chapterBasis">Chapter boundaries</label>
+                                <select id="chapterBasis">
+                                    <option value="topics" selected>Topics (default)</option>
+                                    <option value="speakers" disabled>Every speaker change (no AI)</option>
+                                    <option value="topics_speakers" disabled>Topics and speaker changes</option>
+                                    <option value="timestamps">My exact timestamps</option>
+                                </select>
+                                <label id="chapterCutPointsField" hidden>Chapter cut timestamps
+                                    <textarea id="chapterCutPoints" rows="3" maxlength="4000" placeholder="10:00&#10;25:00"></textarea>
+                                    <small>New lines or commas; MM:SS or HH:MM:SS, optional milliseconds. Enter only cuts inside the video, not 00:00 or video end. AI generates content within each part; these chapter boundaries are never moved or merged, even if a topic crosses a cut. A transcript cue crossing a cut may inform both parts. Silent parts without transcript text are grey.</small>
+                                </label>
+                                <button id="openProjectSplitBtn" class="btn btn-secondary btn-action" type="button">Split this video into MP4s (ZIP)</button>
+                                <small id="chapterSpeakerHelp">Label every line's speaker in the Transcript tab to enable speaker boundaries. Speaker boundaries take priority over slide grouping.</small>
+                                <label for="chapterSlideBoundaries">Use detected slide changes for boundary detection</label>
+                                <select id="chapterSlideBoundaries" disabled>
+                                    <option value="none">Off: transcript only</option>
+                                    <option value="chapters">Chapter boundaries</option>
+                                    <option value="sections">Section boundaries</option>
+                                    <option value="both" selected>Chapter and section boundaries</option>
+                                </select>
+                                <small id="chapterSlideHelp">Detect slides first to enable slide-aware boundaries. Slide changes are evidence, not mandatory cuts; transcript introductions are preserved.</small>
+                                <label><input type="checkbox" id="chapterConsiderSlides" checked disabled> Also group topics on the same slide into one chapter</label>
+                                <label for="chapterPasses">Generation passes</label>
+                                <select id="chapterPasses">
+                                    <option value="one" selected>One outline pass + cut verification (faster)</option>
+                                    <option value="two">Two outline passes + cut verification</option>
                                 </select>
                                 <label for="chapterStructure">Structure</label>
                                 <select id="chapterStructure">
@@ -520,6 +791,9 @@
                                     <option value="balanced" selected>Balanced: distinct topics</option>
                                     <option value="detailed">Detailed: finer learning objectives</option>
                                 </select>
+                                <label><input id="chapterFlagTranscriptGaps" type="checkbox"> Separate long transcript gaps</label>
+                                <label>Minimum gap (seconds) <input id="chapterTranscriptGapSeconds" type="number" min="5" max="300" step="1" value="10"></label>
+                                <details class="contextual-help"><summary aria-label="Transcript gap help" title="Transcript gap help">?</summary><p>Optional and off by default. Gaps of at least 10 seconds are a conservative starting point; adjust the minimum as needed. Gaps become separate grey review sections labelled No transcript text, without moving chapter boundaries or skipping playback. Transcript gaps may contain demos, music, or missed speech; they are not confirmed audio silence. No audio scan or extra AI request is needed. Only time covered by the transcript or a known video duration can be checked.</p></details>
                                 <label for="chapterInstructions">Extra instructions (optional)</label>
                                 <textarea id="chapterInstructions" rows="3" maxlength="1000" placeholder="e.g. Focus on exam-relevant topics; keep English technical terms; ignore the organisational part"></textarea>
                                 <details class="ui-disclosure">
@@ -529,15 +803,26 @@
                                         <p>Automatic tries Groq, then Gemini and OpenAI. An explicit choice is tried first, with availability fallbacks. Configure API keys on the server, not in the browser.</p>
                                         <p>Chapters follow subjects and learning objectives; sections follow meaningful subtopics.
                                             Examples, demonstrations and continuations stay together. Detail changes topic granularity,
-                                            not a chapter count or duration. No time-based splits, merges or section caps.
+                                            not a chapter count or duration. Automatic modes have no time-based splits, merges or section caps.
                                             Exports reuse saved sections without extra AI calls.</p>
+                                        <p>Automatic topic modes verify chapter cuts against nearby transcript utterances,
+                                            including topic introductions and transitions, before saving. This adds AI requests.
+                                            Slide-aware grouping then aligns eligible chapters to slide starts.
+                                            My exact timestamps keeps your chapter cuts unchanged and verifies only generated section cuts.
+                                            Check cuts before exporting: transcript and AI interpretation can still be imperfect.</p>
                                         <p>Grouping, intervals, timestamps and formats are in Export chapters.</p>
                                     </div>
                                 </details>
                             </div>
-                            <button id="exportChaptersBtn" class="btn btn-secondary btn-action" disabled>
-                                <i class="fas fa-download"></i> Export Chapters
-                            </button>
+                            <details class="action-menu download-menu">
+                                <summary aria-label="Chapter downloads">Downloads</summary>
+                                <div class="row-actions-content">
+                                    <button id="exportChaptersBtn" class="btn btn-secondary btn-action" disabled>
+                                        <i class="fas fa-download" aria-hidden="true"></i> Export chapters
+                                    </button>
+                                    <button id="customClipBtn" class="btn btn-secondary btn-action" type="button"><i class="fas fa-cut" aria-hidden="true"></i> Download custom clip</button>
+                                </div>
+                            </details>
                             <dialog id="exportOptionsDialog" class="options-dialog">
                                 <form method="dialog">
                                 <div class="dialog-header">
@@ -565,9 +850,9 @@
                                 </select>
                                 <label for="subpartMode">Sections inside each part:</label>
                                 <select id="subpartMode">
-                                    <option value="points" selected>Important points/topics</option>
+                                    <option value="points">Important points/topics</option>
                                     <option value="slides">Slide changes inside each part</option>
-                                    <option value="both">Important points and slide changes</option>
+                                    <option value="both" selected>Important points and slide changes</option>
                                 </select>
                                 <label title="Each clip starts 1 second early so the first words of a sentence are not cut off"><input type="checkbox" id="exportClipOverlap" checked> Start clips 1 second early</label>
                                 <label title="Adds the text read from each slide (OCR) as a bullet list under its chapter. Run text extraction on the slides first."><input type="checkbox" id="exportSlideText"> Include slide text (OCR)</label>
@@ -579,13 +864,22 @@
                                 <small id="exportFilenameSuggestion">Suggestion: based on the title and export type</small>
                                 <label><input type="checkbox" id="exportImages"> Images</label>
                                 <label><input type="checkbox" id="exportTranscripts"> Transcript files</label>
-                                <label><input type="checkbox" id="exportClips"> Video clips</label>
-                                <label title="Encodes one extra video file per section (takes longer). The webpage shows each section's clip under its heading."><input type="checkbox" id="exportSectionClips"> Section clips</label>
+                                <label><input type="checkbox" id="exportClips"> Video files (MP4)</label>
+                                <label for="exportVideoScope">Include videos for</label>
+                                <select id="exportVideoScope">
+                                    <option value="chapters">Each chapter</option>
+                                    <option value="parts">Each part / section</option>
+                                    <option value="both" selected>Both chapters and parts / sections</option>
+                                </select>
+                                <input type="checkbox" id="exportSectionClips" hidden aria-hidden="true">
+                                <small>Applies to MP4 files, HTML and SCORM. Parts follow the section grouping above; each selected part gets its own playable video. Both takes longer to encode.</small>
                                 <label title="Title, images and transcript in one document"><input type="checkbox" id="exportWord"> Word document</label>
                                 <label title="Title, images and transcript in one document"><input type="checkbox" id="exportPdf"> PDF document</label>
-                                <label title="Sections, slides, clips and transcript in a webpage package"><input type="checkbox" id="exportWebpage" checked> HTML webpage</label>
+                                <label title="Sections, slides, video clips and transcript in a webpage package. Re-encoding long videos can take time."><input type="checkbox" id="exportWebpage" checked> HTML webpage (with video clips)</label>
+                                <label title="Embedded screenshots with the currently displayed transcript during each slide. No summaries, OCR text or videos. Select only this option for a single HTML file."><input type="checkbox" id="exportScreenshotTranscript" disabled> Screenshots + transcript only (HTML)</label>
                                 <label><input type="checkbox" id="exportOutline"> Word outline</label>
                                 <label><input type="checkbox" id="exportScorm"> SCORM 1.2 LMS package</label>
+                                <small>For a fast export without video encoding, select only Screenshots + transcript (HTML), Word or PDF. Webpage and SCORM packages include video clips.</small>
                                 <small id="exportAvailabilityNote" role="status"></small>
                             </fieldset>
                             <div class="dialog-actions">
@@ -595,22 +889,51 @@
                                 </form>
                             </dialog>
                         </div>
+                        <div class="selected-video-controls" role="group" aria-label="Select chapters and sections">
+                            <button id="selectAllClipsBtn" class="btn btn-secondary btn-action" type="button" disabled>Select all</button>
+                            <button id="unselectAllClipsBtn" class="btn btn-secondary" type="button" disabled>Unselect all</button>
+                        </div>
+                        <div id="clipSelectionActions" class="selected-video-controls clip-selection-actions" role="group" aria-label="Selected chapter and section actions" hidden>
+                            <span id="clipSelectionCount" aria-live="polite"></span>
+                            <button id="downloadSelectedClipsBtn" class="btn btn-secondary btn-action btn-icon" type="button" title="Download selected clips" aria-label="Download selected clips"><i class="fas fa-download" aria-hidden="true"></i></button>
+                            <button id="projectSelectedClipsBtn" class="btn btn-secondary btn-action btn-icon" type="button" title="Open selected clips as a new project" aria-label="Open selected clips as a new project"><i class="fas fa-external-link-alt" aria-hidden="true"></i></button>
+                            <button id="mergeSelectedSectionsBtn" class="btn btn-secondary btn-action btn-icon" type="button" title="Merge adjacent selected sections" aria-label="Merge adjacent selected sections" disabled><i class="fas fa-object-group" aria-hidden="true"></i></button>
+                            <button id="deleteSelectedSectionsBtn" class="btn btn-secondary btn-action btn-icon" type="button" title="Delete selected sections" aria-label="Delete selected sections" disabled><i class="fas fa-trash" aria-hidden="true"></i></button>
+                            <label><input id="mergeSelectedClips" type="checkbox"> One MP4 (selected parts only)</label>
+                            <button id="clearClipSelectionBtn" class="btn btn-secondary btn-action btn-icon" type="button" title="Clear selection" aria-label="Clear selection"><i class="fas fa-times" aria-hidden="true"></i></button>
+                            <details class="contextual-help"><summary aria-label="Selected sections help" title="Selected sections help">?</summary><p>Downloads and new clip projects follow the saved clip order, including Review and Skip sections. New projects retime copied content to match the output. Set the order in Chapter options, Reorganize chapters, Reorder clips. Original playback and navigation keep source timestamps. Reset clip order before merging or changing source boundaries. Merge combines adjacent selected groups, including across chapter boundaries, in the earliest chapter. Following chapter starts move to their first remaining section; empty chapters are removed. Isolated sections stay unchanged. Each group gets a title and summary covering all its sections. Select adjacent chapter rows instead to merge whole chapters: all their sections are kept and the merged chapter gets a new title and summary. Delete removes outline labels, not original footage. These outline edits do not change existing video files or exports.</p></details>
+                        </div>
+                        <p id="selectedClipsStatus" role="status" aria-live="polite"></p>
+                        <p id="chapterProjectStatus" role="status" aria-live="polite" hidden></p>
+                        <button id="cancelChapterProjectBtn" class="btn btn-secondary btn-action" type="button" aria-label="Stop creating chapter project" hidden><i class="fas fa-stop" aria-hidden="true"></i></button>
+                        <button id="openChapterProjectBtn" class="btn btn-secondary btn-action" type="button" hidden>Open chapter project</button>
+                        <p id="chapterNowPlaying" class="chapter-now-playing" role="status" aria-live="polite" aria-atomic="true" hidden></p>
                         <div class="tab-body" id="chaptersContainer">
                             <div id="summaryStatus" class="summary-status" role="status" aria-live="polite"></div>
-                            <p>Click "Generate Summary" to create chapter markers from the transcript.</p>
+                            <p>Click "Generate chapters" to create chapter markers from the transcript.</p>
                         </div>
                         <div id="exportProgress" class="summary-status" role="status" aria-live="polite"></div>
-                        <section class="saved-exports" aria-labelledby="savedExportsTitle">
+                        <details class="saved-exports" id="savedExportsMenu">
+                            <summary id="savedExportsTitle">Saved exports</summary>
                             <div class="saved-exports-header">
-                                <h3 id="savedExportsTitle"><i class="fas fa-folder-open" aria-hidden="true"></i> Saved exports</h3>
                                 <button id="refreshSavedExportsBtn" type="button" class="btn btn-secondary btn-action btn-icon" title="Refresh saved exports" aria-label="Refresh saved exports"><i class="fas fa-sync-alt" aria-hidden="true"></i></button>
                             </div>
                             <div id="savedExports"></div>
-                        </section>
+                        </details>
                     </div>
                     
                     <div class="tab-pane" id="scenes-tab">
-                        <div class="controls-bar">
+                        <div class="controls-bar slide-controls">
+                            <button id="edit-slides-btn" class="btn btn-secondary btn-action" type="button" disabled>Edit slide titles</button>
+                            <label for="slideTranslationTarget">Slide title language</label>
+                            <select id="slideTranslationTarget">
+                                <option value="transcript" selected>Open transcript's language</option>
+                                <option value="en">English</option>
+                                <option value="de">German</option>
+                                <option value="ar">Arabic</option>
+                                <option value="pl">Polish</option>
+                            </select>
+                            <button id="translateSlideTitlesBtn" class="btn btn-secondary btn-action" type="button" disabled>Translate slide titles</button>
                             <button id="detectScenesBtn" class="btn btn-secondary btn-action" disabled>
                                 <i class="fas fa-film"></i> Detect Slides
                             </button>
@@ -633,21 +956,24 @@
                                     <button class="dialog-close" type="submit" value="cancel" aria-label="Close slide detection options">&times;</button>
                                 </div>
                                 <div class="scene-threshold-control">
+                                <button id="openSlideHistoryBtn" class="btn btn-secondary" type="button">View saved slide sets...</button>
+                                <div id="adaptiveDetectionOptions">
+                                    <label for="adaptiveDetail">Which slide changes should appear?</label>
+                                    <select id="adaptiveDetail">
+                                        <option value="fewer">Slide changes only (ignore added bullets)</option>
+                                        <option value="balanced" selected>Slide changes and major variations (recommended)</option>
+                                        <option value="more">Slide changes and every addition</option>
+                                    </select>
+                                    <details class="ui-disclosure" data-help-for="adaptiveDetail"><summary>? Help</summary><p>All choices keep detected full slide replacements. Variations include bullet points, text or diagrams appearing step by step on the same slide (sometimes called slide builds). Choose whether major variations or every addition should be saved as separate slide images. A slide must settle long enough to be sampled; brief flashes and continuous animation may not be detected.</p></details>
+                                </div>
+                                <details id="advancedSlideDetectionOptions" class="ui-disclosure">
+                                <summary>Advanced: method and limits</summary>
                                 <label for="sceneDetectionMode">Detection method</label>
                                 <select id="sceneDetectionMode">
-                                    <option value="content" selected>Content cuts (recommended)</option>
-                                    <option value="adaptive">Adaptive slides</option>
-                                    <option value="chapters">Transcript chapters only</option>
+                                    <option value="adaptive" selected>Slide changes (recommended)</option>
+                                    <option value="content">Hard cuts (for edited video)</option>
+                                    <option value="chapters">Use chapter starts instead of detecting slides</option>
                                 </select>
-                                <div id="adaptiveDetectionOptions">
-                                    <label for="adaptiveDetail">Detail level</label>
-                                    <select id="adaptiveDetail">
-                                        <option value="fewer">Fewer slides</option>
-                                        <option value="balanced" selected>Balanced</option>
-                                        <option value="more">More slides</option>
-                                    </select>
-                                    <details class="ui-disclosure"><summary>Detail levels</summary><p>More keeps each build. Balanced merges small builds. Fewer merges builds and quick flips. Full slide changes are always kept.</p></details>
-                                </div>
                                 <div id="contentCutOptions" hidden>
                                     <label class="range-label" for="contentCutThreshold">
                                         <span>Cut threshold</span>
@@ -657,18 +983,18 @@
                                     <small>Lower values detect more hard cuts. Higher values detect fewer cuts.</small>
                                 </div>
                                 <div id="visualDetectionOptions">
-                                    <label for="minimumSlideDuration">Minimum slide duration (% of video length)</label>
+                                    <label for="minimumSlideDuration">Ignore quick additions</label>
                                     <select id="minimumSlideDuration">
-                                        <option value="auto" selected>Match detail level (More 0.25%, Balanced 0.5%, Fewer 1%)</option>
+                                        <option value="auto" selected>Only flashes under 2 seconds (recommended)</option>
                                         <option value="0.25">0.25% (9 s per hour of video)</option>
                                         <option value="0.5">0.5% (18 s per hour of video)</option>
                                         <option value="1">1% (36 s per hour of video)</option>
                                         <option value="2">2% (72 s per hour of video)</option>
                                     </select>
-                                    <small>Scales with the video, with a 2 s floor for short clips.</small>
+                                    <small>Custom percentages combine additions appearing close together on the same slide. In adaptive mode, full slide replacements are preserved and earlier slide starts are not moved. Hard cuts use this as a minimum for all cuts.</small>
                                     <label for="maximumSlidesPerHour">Maximum slides per hour</label>
                                     <select id="maximumSlidesPerHour">
-                                        <option value="auto" selected>Match detail level (More/Balanced unlimited, Fewer 60)</option>
+                                        <option value="auto" selected>Keep all detected slides (recommended)</option>
                                         <option value="40">40</option>
                                         <option value="60">60</option>
                                         <option value="90">90</option>
@@ -676,24 +1002,39 @@
                                     </select>
                                     <details class="ui-disclosure"><summary>Slide limits</summary><p>A fixed limit applies at every detail level. Short clips may include up to 10 slides. At the limit, the most distinct changes are kept.</p></details>
                                     <label><input id="mergeSimilarSlides" type="checkbox" checked> Merge visually similar slides</label>
-                                    <label for="slideImageQuality">Screenshot quality</label>
+                                </div>
+                                <label id="includeChapterBoundariesLabel">
+                                    <input id="includeChapterBoundaries" type="checkbox" checked>
+                                    Include chapter boundaries
+                                </label>
+                                <details class="ui-disclosure" data-help-for="sceneDetectionMode"><summary>? Method help</summary><p id="sceneDetectionHelp">Adaptive mode ignores cursor and webcam movement and combines step-by-step additions according to the detail level.</p></details>
+                                </details>
+                                    <label for="slideImageQuality">Image quality</label>
                                     <select id="slideImageQuality">
                                         <option value="480">Compact, 480p (fastest)</option>
                                         <option value="720" selected>Medium, 720p</option>
                                         <option value="1080">High, 1080p (slower and larger)</option>
                                     </select>
                                 </div>
-                                <label id="includeChapterBoundariesLabel">
-                                    <input id="includeChapterBoundaries" type="checkbox" checked>
-                                    Include chapter boundaries
-                                </label>
-                                <details class="ui-disclosure"><summary>Detection help</summary><p id="sceneDetectionHelp">Adaptive mode ignores cursor and webcam movement and merges slide builds by detail level.</p></details>
-                                </div>
                                 <div class="dialog-actions">
                                     <button class="btn btn-secondary" type="submit" value="cancel">Cancel</button>
                                     <button id="startSceneDetectionBtn" class="btn btn-accent" type="button">Start detection</button>
                                 </div>
                                 </form>
+                            </dialog>
+                            <button id="slideHistoryBtn" class="btn btn-secondary" type="button">Slide history</button>
+                            <dialog id="slideHistoryDialog" class="options-dialog" aria-labelledby="slideHistoryHeading">
+                                <form method="dialog"><div class="dialog-header">
+                                    <h2 id="slideHistoryHeading">Saved slide sets</h2>
+                                    <button class="dialog-close" type="submit" aria-label="Close slide history">&times;</button>
+                                </div></form>
+                                <label for="slideHistorySelect">Detection run</label>
+                                <select id="slideHistorySelect"></select>
+                                <p id="slideHistoryStatus" role="status"></p>
+                                <div id="slideHistoryImages" class="slide-history-images"></div>
+                                <details class="ui-disclosure" data-help-for="slideHistorySelect"><summary>? History help</summary>
+                                    <p>View saved slides while new detection runs. Clicking a timestamp seeks the current video without replacing the active slide analysis. Sets are preserved from now on; previously overwritten slides cannot be recovered.</p>
+                                </details>
                             </dialog>
                         </div>
                         <div class="tab-body" id="scenesContainer">
@@ -766,6 +1107,16 @@
             <span id="closeSettingsBtn" class="modal-close">&times;</span>
             <h2><i class="fas fa-cog"></i> Settings</h2>
             
+            <div class="settings-section">
+                <label for="transcriptReadyAction">When a new transcript is ready</label>
+                <select id="transcriptReadyAction">
+                    <option value="ask">Ask me (recommended)</option>
+                    <option value="chapters">Start chapters</option>
+                    <option value="slides">Start slide detection</option>
+                    <option value="both">Start chapters and slide detection</option>
+                    <option value="none">Keep both manual</option>
+                </select>
+            </div>
             <div class="settings-section">
                 <h3>Compute device</h3>
                 <p id="runtimeStatus" class="settings-description">Checking GPU availability...</p>
@@ -866,5 +1217,51 @@
         }
     });
     </script>
+    <dialog id="customClipDialog" class="options-dialog">
+        <form id="customClipForm">
+            <h3>Download custom clip</h3>
+            <p>While the video plays, click Start here beside the timeline, then End here to mark your clip. You can also drag IN and OUT, enter timestamps with optional milliseconds, or use the pin buttons. Uses the selected video and captions.</p>
+            <label for="customClipStart">Start timestamp</label>
+            <div class="custom-clip-time-field">
+                <input id="customClipStart" type="text" placeholder="00:00:00" required>
+                <button id="customClipSetStartBtn" class="btn btn-secondary btn-icon" type="button" aria-label="Set clip start to current video time" title="Set start at current video time"><i class="fas fa-map-pin" aria-hidden="true"></i></button>
+                <button id="customClipVideoStartBtn" class="btn btn-secondary" type="button" title="Set clip start to 00:00:00">Video start</button>
+            </div>
+            <label for="customClipEnd">End timestamp</label>
+            <div class="custom-clip-time-field">
+                <input id="customClipEnd" type="text" placeholder="00:01:00" required>
+                <button id="customClipSetEndBtn" class="btn btn-secondary btn-icon" type="button" aria-label="Set clip end to current video time" title="Set end at current video time"><i class="fas fa-map-pin" aria-hidden="true"></i></button>
+                <button id="customClipVideoEndBtn" class="btn btn-secondary" type="button" title="Set clip end to the full video duration">Video end</button>
+            </div>
+            <small>Marker keys: arrows = 1 second, Shift = 10 seconds, Alt = 0.1 seconds.</small>
+            <details id="clipPrivacyOptions">
+                <summary>Privacy / hide regions</summary>
+                <label><input id="clipPrivacyEnabled" type="checkbox"> Apply privacy masks to this download</label>
+                <p>Draw a box on the preview, choose an existing detected region, or scan for people.
+                    Detection samples every 0.5 seconds and can miss faces, moving people or webcam tiles.
+                    Review the entire output before sharing. Blur/pixelation are not guaranteed anonymization.
+                    Audio and subtitles are kept and may still identify people.
+                    Scanning runs locally; first use downloads the people-detection model, not your video.</p>
+                <label for="clipPrivacyEffect">New region appearance</label>
+                <select id="clipPrivacyEffect">
+                    <option value="blur">Blur</option>
+                    <option value="pixelate">Pixelate</option>
+                    <option value="cover">Solid black cover</option>
+                </select>
+                <div class="row-actions">
+                    <select id="clipPrivacyDetection" aria-label="Detected region in the current slide"></select>
+                    <button id="clipPrivacyAddDetection" class="btn btn-secondary" type="button">Add detected region</button>
+                    <button id="clipPrivacyAddManual" class="btn btn-secondary" type="button">Add adjustable box</button>
+                    <button id="clipPrivacyScan" class="btn btn-secondary" type="button">Find people in clip</button>
+                </div>
+                <canvas id="clipPrivacyPreview" class="clip-privacy-preview" aria-label="Privacy preview. Drag to add a box, or use Add adjustable box and edit its coordinates."></canvas>
+                <p id="clipPrivacyStatus" role="status" aria-live="polite"></p>
+                <div id="clipPrivacyRegions"></div>
+            </details>
+            <p id="customClipStatus" role="status" aria-live="polite"></p>
+            <button id="downloadCustomClipBtn" class="btn btn-accent" type="submit">Download clip</button>
+            <button id="closeCustomClipBtn" class="btn btn-secondary" type="button">Close</button>
+        </form>
+    </dialog>
 </body>
 </html> 

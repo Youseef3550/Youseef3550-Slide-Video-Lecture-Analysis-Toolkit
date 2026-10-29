@@ -5,6 +5,10 @@ const assert = require('node:assert/strict');
 const source = fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 'caption-export.js'), 'utf8')
     .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
 const ids = {};
+ids.uploadedVideos = {options: [], value: '', appendChild(option) { this.options.push(option); }};
+ids.videoVersions = {options: [], dataset: {}, value: '',
+    replaceChildren() { this.options = []; }, appendChild(option) { this.options.push(option); },
+    addEventListener() {}};
 for (const id of ['captionMediaStatus', 'useCaptionCopyBtn', 'restoreOriginalVideoBtn',
     'savedCaptionVideoSelect', 'downloadSavedCaptionVideoBtn', 'savedCaptionVideosStatus']) {
     ids[id] = {textContent: '', value: '', disabled: false, addEventListener() {}};
@@ -66,6 +70,12 @@ vm.runInContext(source, context);
     await first;
     assert.equal(requests, 1, 'Concurrent switches must not race');
     assert.equal(context.selectedMediaExportId('video'), 'copy');
+    assert.equal(ids.uploadedVideos.options.length, 0, 'Captioned copies never clutter Saved uploads');
+    assert.equal(ids.videoVersions.value, 'copy');
+    assert.equal(ids.videoVersions.dataset.videoId, 'video');
+    assert.equal(ids.videoVersions.options[1].textContent, job.filename);
+    context.addSavedCaptionVariation('video', job);
+    assert.equal(ids.videoVersions.options.length, 2, 'Repeated openings must not duplicate saved variations');
     assert.equal(context.selectedMediaExportId('other'), null);
     assert.equal(player.currentTime, 42);
     assert.equal(player.playbackRate, 1.5);
@@ -88,6 +98,7 @@ vm.runInContext(source, context);
     assert.equal(state.videoScenes, scenes);
     await context.useVideoCopy();
     assert.equal(player.src, '/video/video');
+    assert.equal(ids.videoVersions.value, '', 'Restoring the original also updates Video version');
     assert.equal(context.selectedMediaExportId('video'), null);
     assert.equal(tracks.length, 0);
     assert.equal(removedTracks.length, 2);

@@ -249,7 +249,7 @@ These are the changes specifically described as fixes to the inherited project. 
   (summaries and exports follow the chosen version), or delete versions you no longer need.
 - **Editable Content**: Use the pencil beside a chapter or section to correct its title,
   timestamps, summaries and section text; timestamps must remain ordered and sections
-  inside their chapter. Manually changed timestamps are preserved exactly in new exports.
+  inside their chapter. Manually changed timestamps are preserved exactly in new exports. When a chapter or section start is moved later, Save asks whether the vacated time should become a new chapter/section (OK) or extend the previous one (Cancel).
   **Edit slide titles** sets video-wide title overrides (leave blank to restore automatic
   titles). **Edit transcript** corrects segment text without changing timing or speakers
   and saves an edited version while keeping the original in the version list.

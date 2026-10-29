@@ -152,6 +152,16 @@ async def _outline_media_duration(video_id):
     return round(duration, 3)
 
 
+def _split_gap(edit, old, new_stamp):
+    """Return the vacated start time when the user chose a new row for it, else None."""
+    gap = edit.get("split_gap")
+    if gap is None:
+        return None
+    if not isinstance(gap, str) or gap != old.get("timestamp") or _seconds(gap) >= _seconds(new_stamp):
+        raise HTTPException(400, "A new row can only be created at the time a later start vacated.")
+    return gap
+
+
 def _chapters(original, edits):
     if not isinstance(edits, list) or len(edits) != len(original):
         raise HTTPException(400, "The chapter count must not change.")
@@ -161,6 +171,10 @@ def _chapters(original, edits):
             raise HTTPException(400, "Invalid chapter edit.")
         timestamp = _text(edit.get("timestamp"), "Chapter timestamp", limit=30)
         _seconds(timestamp)
+        gap = _split_gap(edit, old, timestamp)
+        if gap:
+            result.append({"timestamp": gap, "title": "New chapter", "summary": "", "sections": [],
+                           "user_edited": True, "timestamp_edited": True})
         chapter = {**old, "title": _text(edit.get("title"), "Chapter title", limit=500),
                    "timestamp": timestamp, "summary": _text(edit.get("summary", ""), "Chapter summary", blank=True),
                    "user_edited": True}
@@ -172,11 +186,17 @@ def _chapters(original, edits):
         if not isinstance(changed, list) or len(changed) != len(sections):
             raise HTTPException(400, "The section count must not change.")
         chapter["sections"] = []
-        for section, change in zip(sections, changed):
+        for position, (section, change) in enumerate(zip(sections, changed)):
             if not isinstance(change, dict):
                 raise HTTPException(400, "Invalid section edit.")
             stamp = _text(change.get("timestamp"), "Section timestamp", limit=30)
             _seconds(stamp)
+            gap = _split_gap(change, section, stamp)
+            if gap and position == 0:
+                raise HTTPException(400, "Create a new chapter, not a section, before a chapter's first part.")
+            if gap:
+                chapter["sections"].append({"timestamp": gap, "title": "New section", "point": "",
+                                            "user_edited": True, "timestamp_edited": True})
             chapter["sections"].append({
                 **section, "timestamp": stamp, "title": _text(change.get("title"), "Section title", limit=500),
                 **_review_fields(change, section),

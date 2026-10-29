@@ -88,9 +88,51 @@ function selection(kind) {
     };
 }
 
+export function laterStartChoices(draft, saved) {
+    const choices = [];
+    draft.forEach((chapter, ci) => {
+        const before = saved[ci];
+        if (!before) return;
+        const later = (now, was) => Number.isFinite(seconds(now)) && seconds(now) > seconds(was);
+        if (later(chapter.timestamp, before.timestamp)) {
+            choices.push({chapter: ci, old: before.timestamp, label: chapter.title,
+                previous: draft[ci - 1]?.title || ''});
+        }
+        chapter.sections?.forEach((section, si) => {
+            if (si && before.sections?.[si] && later(section.timestamp, before.sections[si].timestamp)) {
+                choices.push({chapter: ci, section: si, old: before.sections[si].timestamp,
+                    label: section.title, previous: chapter.sections[si - 1].title});
+            }
+        });
+    });
+    return choices;
+}
+
+export function applyLaterStartChoices(draft, saved, ask) {
+    const result = clone(draft);
+    for (const choice of laterStartChoices(draft, saved)) {
+        const item = choice.section == null ? draft[choice.chapter] : draft[choice.chapter].sections[choice.section];
+        const kind = choice.section == null ? 'chapter' : 'section';
+        const target = choice.section == null ? result[choice.chapter] : result[choice.chapter].sections[choice.section];
+        const now = formatTimestamp(item.timestamp), was = formatTimestamp(choice.old);
+        if (ask(`The ${kind} "${choice.label}" now starts at ${now} instead of ${was}.\n\n`
+            + `Time from ${was} to ${now} will otherwise be added to ${choice.previous ? `"${choice.previous}"` : 'the previous content'}.\n\n`
+            + `OK: create a new ${kind} starting at ${was}.\nCancel: add that time to the previous ${kind}.`)) {
+            target.split_gap = choice.old;
+        }
+    }
+    return result;
+}
+
 export function initInlineEditor() {
     let editing = null;
     let loading = false;
+    const offerNewRowsForLaterStarts = snapshot => {
+        const saved = snapshot.operations.reduce(
+            (chapters, operation) => applyOutlineOperation(chapters, operation), snapshot.initialDraft);
+        return snapshot.draft[0]?.clip_arrangement ? snapshot.draft
+            : applyLaterStartChoices(snapshot.draft, saved, message => window.confirm(message));
+    };
     const sameSelection = snapshot => JSON.stringify(selection(snapshot.kind)) === JSON.stringify(snapshot.context);
     const content = kind => kind === 'chapters' ? state.videoChapters
         : kind === 'slides' ? state.videoScenes : state.currentTranscript;
@@ -470,6 +512,13 @@ export function initInlineEditor() {
         const snapshot = editing;
         if (!sameSelection(snapshot)) { close(false); showError('The video or transcript changed. Reopen inline editing.'); return; }
         snapshot.saving = true;
+        let edits = snapshot.kind === 'slides'
+            ? snapshot.draft.map(item => ({title: item.title, timestamp: item.timestamp}))
+            : snapshot.kind === 'transcript' ? snapshot.draft.map(item => item.text) : snapshot.draft;
+        if (snapshot.kind === 'chapters') {
+            try { edits = offerNewRowsForLaterStarts(snapshot); }
+            catch (error) { snapshot.saving = false; status.textContent = error.message; status.classList.add('outline-error'); return; }
+        }
         save.disabled = cancel.disabled = true;
         reorderMode.disabled = resetOrder.disabled = true;
         container(snapshot.kind).inert = true;
@@ -479,9 +528,7 @@ export function initInlineEditor() {
             const response = await fetch(`/editable_content/${encodeURIComponent(snapshot.context.videoId)}`, {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({...snapshot.context, revision: snapshot.revision, operations: snapshot.operations,
-                    edits: snapshot.kind === 'slides'
-                        ? snapshot.draft.map(item => ({title: item.title, timestamp: item.timestamp}))
-                        : snapshot.kind === 'transcript' ? snapshot.draft.map(item => item.text) : snapshot.draft}),
+                    edits}),
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.detail || 'Could not save changes.');

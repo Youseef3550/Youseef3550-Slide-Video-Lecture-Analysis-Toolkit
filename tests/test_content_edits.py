@@ -627,6 +627,42 @@ class ContentEditsTests(unittest.TestCase):
             result = asyncio.run(processor.get_summary("vid"))
         self.assertEqual(result["chapters"], saved)
 
+    def test_later_start_can_create_a_new_row_for_the_vacated_time(self):
+        chapters = [
+            {"timestamp": "00:00", "title": "First", "sections": [
+                {"timestamp": "00:00", "title": "A"}, {"timestamp": "00:10", "title": "B"}]},
+            {"timestamp": "00:20", "title": "Second", "sections": [
+                {"timestamp": "00:20", "title": "C"}, {"timestamp": "00:40", "title": "D"}]},
+        ]
+        self.write(self.SUMMARIES_DIR / "vid.json", chapters)
+        edits = copy.deepcopy(chapters)
+        edits[0]["sections"][1].update(timestamp="00:14", split_gap="00:10")
+        saved = self.save("chapters", edits)["content"]
+        self.assertEqual([(part["timestamp"], part["title"]) for part in saved[0]["sections"]],
+                         [("00:00", "A"), ("00:10", "New section"), ("00:14", "B")])
+        self.assertNotIn("split_gap", saved[0]["sections"][2])
+        self.assertEqual(self.get("chapters")["content"], saved)
+
+        self.write(self.SUMMARIES_DIR / "vid.json", chapters)
+        edits = copy.deepcopy(chapters)
+        edits[1].update(timestamp="00:30", split_gap="00:20")
+        saved = self.save("chapters", edits)["content"]
+        self.assertEqual([(item["timestamp"], item["title"]) for item in saved],
+                         [("00:00", "First"), ("00:20", "New chapter"), ("00:30", "Second")])
+        self.assertEqual(saved[1]["sections"], [])
+        self.assertEqual(saved[2]["sections"][0]["timestamp"], "00:30")
+
+        self.write(self.SUMMARIES_DIR / "vid.json", chapters)
+        for bad in ({"timestamp": "00:14", "split_gap": "00:11"}, {"timestamp": "00:08", "split_gap": "00:10"},
+                    {"timestamp": "00:14", "split_gap": 10}):
+            edits = copy.deepcopy(chapters)
+            edits[0]["sections"][1].update(bad)
+            self.save("chapters", edits, status=400)
+        edits = copy.deepcopy(chapters)
+        edits[0]["sections"][0].update(timestamp="00:05", split_gap="00:00")
+        self.save("chapters", edits, status=400)
+        self.assertEqual(self.get("chapters")["content"], chapters)
+
     def test_chapter_start_updates_first_section_and_previous_range(self):
         chapters = [
             {"timestamp": "00:00", "title": "First", "sections": [
